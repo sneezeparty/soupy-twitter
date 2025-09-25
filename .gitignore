@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+
+# Logs
+*.log
+soupy.log
+
+# Envs
+.env
+
+# Playwright
+user_data/
+playwright-report/
+test-results/
+
+# Editors/IDE
+.vscode/
+.idea/
+soupy-twitter.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
