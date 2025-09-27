@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import List, Optional, Dict, Tuple
+import asyncio
 
 from loguru import logger
 
@@ -26,9 +27,7 @@ class ContextEnricher:
         if not base_context:
             base_context = {}
 
-        # Include existing details
-        if base_context.get("author"):
-            details.append(f"author: {base_context['author']}")
+        # Include existing details (never include author/handle in LLM context)
         if base_context.get("link"):
             details.append(f"link: {base_context['link']}")
         if base_context.get("hashtags"):
@@ -36,27 +35,70 @@ class ContextEnricher:
         if base_context.get("mentions"):
             details.append("mentions: " + ", ".join(base_context["mentions"]))
 
+        # Include a hint if the original post already contains a URL
+        try:
+            urls_in_text = extract_urls(tweet_text)
+            if urls_in_text:
+                details.append("original_has_url: yes")
+        except Exception:
+            pass
+
         # Include thread context if available (for Bluesky)
         if base_context.get("root_post"):
             root_post = base_context["root_post"]
             root_text = root_post.get("text", "")
-            root_author = root_post.get("author", "")
             thread_depth = base_context.get("thread_depth", 1)
-            
+
             if root_text and root_text != tweet_text:  # Only include if different from current post
-                details.append(f"root_post: {root_author}: {root_text[:200]}")
+                details.append(f"root_post: {root_text[:200]}")
                 if thread_depth > 1:
                     details.append(f"thread_depth: {thread_depth} levels")
+
+        # Add ancestors (nearest first)
+        if base_context.get("ancestors"):
+            try:
+                ancestors = base_context["ancestors"][:3]
+                for idx, anc in enumerate(ancestors, start=1):
+                    a_text = (anc.get("text") or "")[:160]
+                    if a_text:
+                        details.append(f"ancestor{idx}: {a_text}")
+            except Exception:
+                pass
+
+        # Add a sample of sibling replies to capture thread vibe
+        if base_context.get("sibling_replies"):
+            try:
+                sibs = base_context["sibling_replies"][:4]
+                quotes: List[str] = []
+                for s in sibs:
+                    s_text = (s.get("text") or "").strip()
+                    if s_text:
+                        quotes.append(s_text[:140])
+                if quotes:
+                    details.append("thread_vibe: " + " | ".join(quotes[:3]))
+            except Exception:
+                pass
+
+        # Optionally include a hint of immediate child replies
+        if base_context.get("child_replies"):
+            try:
+                crs = base_context["child_replies"][:2]
+                for c in crs:
+                    c_text = (c.get("text") or "").strip()
+                    if c_text:
+                        details.append(f"child: {c_text[:140]}")
+            except Exception:
+                pass
 
         # Include quoted post context if available (for Bluesky quotes)
         if base_context.get("quoted_post"):
             qp = base_context["quoted_post"]
             qp_text = qp.get("text") or ""
-            qp_author = qp.get("author") or ""
             if qp_text:
-                details.append(f"quoted_post: {qp_author}: {qp_text[:200]}")
+                details.append(f"quoted_post: {qp_text[:200]}")
 
         # URL enrichment
+        url_summary_added = False
         if self._config.url_enrichment:
             urls = list(base_context.get("urls") or [])
             if not urls:
@@ -67,6 +109,7 @@ class ContextEnricher:
             if url_bullets:
                 details.append(f"url_summary: {url_bullets}")
                 logger.info("Enrichment: URL summary ready ({} chars)", len(url_bullets))
+                url_summary_added = True
             else:
                 logger.info("Enrichment: no usable URL summary")
 
@@ -79,8 +122,8 @@ class ContextEnricher:
         except Exception as exc:
             logger.warning("Tweet analysis failed: {}", exc)
 
-        # Web search enrichment (secondary)
-        if self._config.web_search_enrichment:
+        # Web search enrichment (secondary). If we already summarized a URL, skip adding generic web search to avoid drift.
+        if self._config.web_search_enrichment and not url_summary_added:
             logger.info("Enrichment: deriving brief search context from tweet text")
             logger.info("Enrichment: tweet excerpt => {}", tweet_text.strip().replace("\n", " ")[:200])
             search_result = self._search_context(tweet_text, base_context)
@@ -128,21 +171,30 @@ class ContextEnricher:
         # Build a focused query from topic/hashtags/text
         query, entities = self._build_search_query(tweet_text, base_context)
         try:
-            results = self._perform_duckduckgo_search(query, self._config.web_search_results)
-            # Filter by entities if present
-            used_results: List[Tuple[str, str, str]]
-            if entities:
-                entity_set = {e.lower() for e in entities}
-                filtered: List[Tuple[str, str, str]] = []
-                for (title, url, snippet) in results:
-                    hay = f"{title} {snippet}".lower()
-                    if any(ent in hay for ent in entity_set):
-                        filtered.append((title, url, snippet))
-                used_results = filtered if filtered else results
+            # First try rich websearch integration if available
+            rich_snippets: Optional[Tuple[List[str], List[str]]] = None
+            try:
+                rich_snippets = self._websearch_rich_snippets(query, max_results=max(5, self._config.web_search_results))
+            except Exception:
+                rich_snippets = None
+            if rich_snippets and rich_snippets[0]:
+                snippets, used_urls = rich_snippets
             else:
-                used_results = results
-            used_urls: List[str] = [u for (_, u, _) in used_results]
-            snippets: List[str] = [s for (_, _, s) in used_results if s]
+                # Fallback to lightweight DDG HTML search
+                results = self._perform_duckduckgo_search(query, self._config.web_search_results)
+                used_results: List[Tuple[str, str, str]]
+                if entities:
+                    entity_set = {e.lower() for e in entities}
+                    filtered: List[Tuple[str, str, str]] = []
+                    for (title, url, snippet) in results:
+                        hay = f"{title} {snippet}".lower()
+                        if any(ent in hay for ent in entity_set):
+                            filtered.append((title, url, snippet))
+                    used_results = filtered if filtered else results
+                else:
+                    used_results = results
+                used_urls = [u for (_, u, _) in used_results]
+                snippets = [s for (_, _, s) in used_results if s]
             # Fallback: include tweet text snippet if search yielded nothing
             if not snippets and tweet_text:
                 snippets.append(tweet_text[:240])
@@ -153,6 +205,58 @@ class ContextEnricher:
             return (bullets, used_urls, query)
         except Exception as exc:
             logger.warning("Search enrichment failed: {}", exc)
+            return None
+
+    def _websearch_rich_snippets(self, query: str, max_results: int = 5) -> Optional[Tuple[List[str], List[str]]]:
+        """Use the robust websearch integration (if available) to fetch article content and produce snippets.
+
+        Returns (snippets, used_urls) or None if unavailable or failed.
+        """
+        try:
+            from .websearch import SearchCog  # type: ignore
+        except Exception:
+            return None
+
+        async def run() -> Tuple[List[str], List[str]]:
+            cog = SearchCog(bot=None)  # type: ignore
+            try:
+                results = await cog.perform_text_search(query, max_results=max_results)
+                selected = await cog.select_articles(results)
+                # Fetch contents concurrently (limit to top N)
+                tasks = [cog.fetch_article_content(item.get('href', '')) for item in selected[:max_results]]
+                contents = await asyncio.gather(*tasks, return_exceptions=True)
+                snippets: List[str] = []
+                urls: List[str] = []
+                for item, content in zip(selected[:max_results], contents):
+                    url = item.get('href', '')
+                    if isinstance(content, str) and content.strip():
+                        # Build a compact snippet from title and first ~400 chars
+                        title = (item.get('title') or '').strip()
+                        text = content.strip().replace('\n', ' ')
+                        snippet = (f"{title}: {text[:400]}") if title else text[:400]
+                        snippets.append(snippet)
+                        if url:
+                            urls.append(url)
+                return (snippets, urls)
+            finally:
+                try:
+                    await cog.cog_unload()
+                except Exception:
+                    pass
+
+        try:
+            return asyncio.run(run())
+        except RuntimeError:
+            # If an event loop is already running, create a new one in a thread
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(run())
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+        except Exception:
             return None
 
     def _perform_duckduckgo_search(self, query: str, limit: int) -> List[Tuple[str, str, str]]:
@@ -225,10 +329,7 @@ class ContextEnricher:
         for pn in re.findall(r"\b(?:[A-Z][a-z]+\s){1,3}[A-Z][a-z]+\b", raw):
             if pn not in terms and pn.lower() not in {t.lower() for t in terms}:
                 terms.append(pn)
-        # Author handle as entity if present in context
-        author = (base_context or {}).get("author")
-        if author and author not in terms:
-            terms.append(author.lstrip("@"))
+        # Do not add author handle as a search term to avoid misattributing handles/domains as entities
 
         # Consider hashtags
         hashtags = (base_context or {}).get("hashtags") or []

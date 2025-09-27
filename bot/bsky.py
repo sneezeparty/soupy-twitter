@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from typing import Optional, Dict, Any, List
+import re
+import math
+from datetime import datetime, timezone
 import random
 import time
 import os
@@ -32,7 +35,9 @@ class BskyBot:
         # Recent authors cooldown persisted to disk with timestamps
         self._recent_authors_path = os.path.join(self._config.user_data_dir, "bsky_recent_authors.json")
         self._recent_authors: Dict[str, float] = {}
-        self._author_cooldown_s = max(60.0, float(self._config.bsky_author_cooldown_minutes) * 60.0)
+        # Enforce at least 24h no-repeat per author
+        configured_cooldown_s = float(self._config.bsky_author_cooldown_minutes) * 60.0
+        self._author_cooldown_s = max(24 * 3600.0, configured_cooldown_s)
         self._candidate_pool_size = max(4, int(self._config.bsky_candidate_pool_size))
 
     def start(self) -> None:
@@ -68,6 +73,338 @@ class BskyBot:
                 json.dump(self._replied_order, f)
         except Exception:
             pass
+
+    def get_trending_terms(self, limit: int = 5) -> List[str]:
+        """Extract top trending terms from Popular/Explore feed with political biasing.
+
+        Combines hashtag frequency and simple proper-noun phrases, filters stopwords,
+        and boosts terms that co-occur with political vocabulary.
+        """
+        try:
+            params_pop = bsky_models.AppBskyFeedGetFeed.Params(
+                feed="at://did:plc:public/app.bsky.feed.generator/popular", limit=60
+            )
+            try:
+                # Try a popular generator
+                pop = self._client.app.bsky.feed.get_feed(params_pop)
+                pitems: List[Any] = getattr(pop, "feed", []) or []
+            except Exception:
+                pitems = []
+            # Fallback: timeline as explore proxy
+            if not pitems:
+                params_tl = bsky_models.AppBskyFeedGetTimeline.Params(limit=60)
+                tl = self._client.app.bsky.feed.get_timeline(params_tl)
+                pitems = getattr(tl, "feed", []) or []
+            texts: List[str] = []
+            for it in pitems[:60]:
+                rec = getattr(getattr(it, 'post', None), 'record', None)
+                t = getattr(rec, 'text', '') if rec else ''
+                if t:
+                    texts.append(t)
+            if not texts:
+                return []
+
+            STOP = {
+                "from","to","subject","time","help","all","yours","friday","monday","tuesday","wednesday","thursday","saturday","sunday",
+                "today","tomorrow","yesterday","breaking","update","thread","read","link","please","thanks","amp","http","https"
+            }
+            POL = {
+                "election","vote","voting","ballot","congress","senate","house","supreme court","scotus","union","strike","labor",
+                "worker","workers","minimum wage","medicare","medicaid","social security","healthcare","abortion","immigration","border",
+                "tax","billionaires","wealth","inequality","climate","gaza","ukraine","palestine","israel","police","protest","student debt"
+            }
+
+            freq: Dict[str, int] = {}
+            pol_boost: Dict[str, int] = {}
+
+            for t in texts:
+                tl = t.lower()
+                # hashtags
+                for m in re.findall(r"#[A-Za-z][A-Za-z0-9_]{2,}", t):
+                    k = m.lstrip('#').lower()
+                    if k in STOP or len(k) < 3:
+                        continue
+                    freq[k] = freq.get(k, 0) + 1
+                    if any(p in tl for p in POL):
+                        pol_boost[k] = pol_boost.get(k, 0) + 1
+                # Proper noun phrases up to 4 words
+                for m in re.findall(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})\b", t):
+                    k = m.strip()
+                    if not k or len(k) < 3:
+                        continue
+                    if k.lower() in STOP:
+                        continue
+                    freq[k] = freq.get(k, 0) + 1
+                    if any(p in tl for p in POL):
+                        pol_boost[k] = pol_boost.get(k, 0) + 1
+
+            if not freq:
+                return []
+            # Score = freq + 2*political boost; minor length penalty to prefer concise topics
+            scored = sorted(
+                freq.items(), key=lambda kv: (kv[1] + 2*pol_boost.get(kv[0], 0) - 0.01*len(kv[0])), reverse=True
+            )
+            # Deduplicate case-insensitively, keep original form as key string
+            seen_lower: set[str] = set()
+            top: List[str] = []
+            for term, _ in scored:
+                low = term.lower()
+                if low in seen_lower:
+                    continue
+                seen_lower.add(low)
+                top.append(term)
+                if len(top) >= max(1, limit):
+                    break
+            return top
+        except Exception:
+            return []
+
+    def get_explore_trending_topics(self, limit: int = 10) -> List[str]:
+        """Attempt to fetch Explore/Trending topic labels via unspecced endpoints.
+
+        Falls back to heuristic terms if the endpoint is unavailable.
+        """
+        try:
+            topics: List[str] = []
+            # Try common unspecced method names defensively
+            try:
+                uns = getattr(self._client.app.bsky, "unspecced", None)
+                if uns:
+                    # e.g., getTrendingTopics or get_trending_topics
+                    for meth in ("get_trending_topics", "getTrendingTopics", "getTrendingTopicsSkeleton"):
+                        fn = getattr(uns, meth, None)
+                        if fn:
+                            try:
+                                params_cls = getattr(bsky_models, "AppBskyUnspeccedGetTrendingTopics".replace(".", ""), None)
+                            except Exception:
+                                params_cls = None
+                            try:
+                                # Call without params if signature unknown
+                                resp = fn() if params_cls is None else fn(params_cls.Params(limit=max(1, limit)))
+                            except Exception:
+                                resp = fn()
+                            # Try to read fields generically
+                            data = []
+                            try:
+                                data = getattr(resp, "topics", []) or getattr(resp, "items", []) or getattr(resp, "feed", [])
+                            except Exception:
+                                data = []
+                            for it in data:
+                                name = (
+                                    getattr(it, "label", None)
+                                    or getattr(it, "title", None)
+                                    or getattr(it, "displayName", None)
+                                    or getattr(it, "name", None)
+                                )
+                                if isinstance(name, str) and name.strip():
+                                    topics.append(name.strip())
+                                if len(topics) >= limit:
+                                    break
+                            if topics:
+                                break
+            except Exception:
+                topics = []
+            if topics:
+                # De-duplicate while preserving order and drop trivial tokens
+                seen: set[str] = set()
+                cleaned: List[str] = []
+                STOP = {"the", "and", "or", "a", "an", "of", "for", "to", "in", "on", "more"}
+                for t in topics:
+                    low = t.lower().strip()
+                    if low in seen or low in STOP or len(low) < 3:
+                        continue
+                    seen.add(low)
+                    cleaned.append(t)
+                return cleaned[: max(1, limit)]
+            # Fallback to heuristic
+            return self.get_trending_terms(limit=limit)
+        except Exception:
+            return []
+
+    def select_popular_post_text(self, use_discover: bool = True, limit: int = 60) -> Optional[Dict[str, Any]]:
+        """Pick a high-engagement, recent post from Discover/Popular or Following timeline.
+
+        Returns a dict: {text, uri, cid, author, created_ts, like_count, repost_count, reply_count}
+        """
+        try:
+            items: List[Any] = []
+            if use_discover:
+                try:
+                    params = bsky_models.AppBskyFeedGetFeed.Params(
+                        feed="at://did:plc:public/app.bsky.feed.generator/popular", limit=max(10, limit)
+                    )
+                    feed = self._client.app.bsky.feed.get_feed(params)
+                    items = getattr(feed, "feed", []) or []
+                except Exception:
+                    items = []
+            if not items:
+                params = bsky_models.AppBskyFeedGetTimeline.Params(limit=max(10, limit))
+                feed = self._client.app.bsky.feed.get_timeline(params)
+                items = getattr(feed, "feed", []) or []
+            if not items:
+                return None
+
+            def _metric(post_like: Any) -> tuple[float, Dict[str, Any]]:
+                post = getattr(post_like, "post", post_like)
+                record = getattr(post, "record", None)
+                text = getattr(record, "text", "") if record else ""
+                uri = getattr(post, "uri", None)
+                cid = getattr(post, "cid", None)
+                author_obj = getattr(post, "author", None)
+                author = getattr(author_obj, "handle", None)
+                # Engagement metrics (defensive attribute access)
+                lc = getattr(post, "like_count", None) or getattr(post, "likeCount", None) or 0
+                rc = getattr(post, "repost_count", None) or getattr(post, "repostCount", None) or 0
+                rpc = getattr(post, "reply_count", None) or getattr(post, "replyCount", None) or 0
+                # Recency
+                created_raw = getattr(record, "created_at", None) or getattr(record, "createdAt", None)
+                created_ts = None
+                try:
+                    if isinstance(created_raw, str) and created_raw:
+                        iso = created_raw.replace("Z", "+00:00")
+                        created_ts = datetime.fromisoformat(iso).astimezone(timezone.utc).timestamp()
+                except Exception:
+                    created_ts = None
+                now_ts = time.time()
+                age_h = 24.0
+                if isinstance(created_ts, (int, float)) and created_ts > 0:
+                    age_h = max(0.0, (now_ts - created_ts) / 3600.0)
+                # Score: engagement with recency decay; prefer posts with text
+                engagement = float(lc) * 3.0 + float(rc) * 4.0 + float(rpc) * 2.0
+                recency = 1.0 if age_h <= 0.1 else math.exp(-age_h / 12.0)
+                text_bonus = 0.2 if text and len(text) >= max(1, int(getattr(self._config, "bsky_min_text_len", 10))) else 0.0
+                score = (engagement + 1.0) * recency + text_bonus
+                data = {
+                    "text": text,
+                    "uri": uri,
+                    "cid": cid,
+                    "author": author,
+                    "created_ts": created_ts,
+                    "like_count": int(lc or 0),
+                    "repost_count": int(rc or 0),
+                    "reply_count": int(rpc or 0),
+                }
+                return (score, data)
+
+            scored: List[tuple[float, Dict[str, Any]]] = []
+            for it in items:
+                try:
+                    scored.append(_metric(it))
+                except Exception:
+                    continue
+            if not scored:
+                return None
+            scored.sort(key=lambda x: x[0], reverse=True)
+            
+            # More diverse selection strategy to avoid "samey" posts
+            my_handle_plain = (self._config.bsky_handle or "").lstrip("@").lower()
+            
+            # Strategy 1: Diversify by author (avoid same authors)
+            author_groups = {}
+            for score, post_data in scored:
+                author = (post_data.get("author") or "").lstrip("@").lower()
+                if author != my_handle_plain and (post_data.get("text") or "").strip():
+                    if author not in author_groups:
+                        author_groups[author] = []
+                    author_groups[author].append((score, post_data))
+            
+            # Strategy 2: Diversify by content type (look for different topics)
+            content_diversity = []
+            seen_topics = set()
+            
+            # Sort authors by their best post score
+            sorted_authors = sorted(author_groups.items(), key=lambda x: max(s[0] for s in x[1]), reverse=True)
+            
+            for author, posts in sorted_authors[:10]:  # Consider top 10 authors
+                for score, post_data in posts[:2]:  # Max 2 posts per author
+                    text = post_data.get("text", "").lower()
+                    
+                    # Extract topic keywords for diversity
+                    topic_keywords = []
+                    for word in text.split():
+                        if len(word) > 4 and word.isalpha():
+                            topic_keywords.append(word)
+                    
+                    # Check if this adds diversity
+                    topic_signature = " ".join(sorted(topic_keywords[:5]))
+                    if topic_signature not in seen_topics or len(content_diversity) < 5:
+                        seen_topics.add(topic_signature)
+                        content_diversity.append((score, post_data))
+                        
+                        if len(content_diversity) >= 12:  # Limit pool size
+                            break
+                if len(content_diversity) >= 12:
+                    break
+            
+            # Strategy 3: Weighted random selection favoring diversity
+            if content_diversity:
+                import random
+                # Weight by score but add diversity bonus
+                weights = []
+                for score, post_data in content_diversity:
+                    # Base weight from engagement score
+                    base_weight = max(0.1, score)
+                    # Add diversity bonus (lower scores get slight boost)
+                    diversity_bonus = 1.0 + (1.0 / (score + 1.0))
+                    weights.append(base_weight * diversity_bonus)
+                
+                # Weighted random selection
+                total_weight = sum(weights)
+                if total_weight > 0:
+                    r = random.random() * total_weight
+                    acc = 0.0
+                    for i, weight in enumerate(weights):
+                        acc += weight
+                        if r <= acc:
+                            best = content_diversity[i][1]
+                            logger.debug("Bsky: selected diverse post from {} candidates (score: {:.2f})", 
+                                       len(content_diversity), content_diversity[i][0])
+                            return best
+            
+            # Fallback: if diversity strategy fails, use original method
+            top_count = min(8, max(3, len(scored) // 4))
+            top_posts = scored[:top_count]
+            valid_candidates = []
+            for _, post_data in top_posts:
+                author = (post_data.get("author") or "").lstrip("@").lower()
+                if author != my_handle_plain and (post_data.get("text") or "").strip():
+                    valid_candidates.append(post_data)
+            
+            if valid_candidates:
+                import random
+                best = random.choice(valid_candidates)
+                logger.debug("Bsky: fallback selection from {} top candidates", len(valid_candidates))
+                return best
+            
+            return None
+        except Exception:
+            return None
+
+    def get_discover_texts(self, limit: int = 30) -> List[str]:
+        """Return up to `limit` post texts from Popular/Discover (fallback to timeline)."""
+        try:
+            try:
+                params = bsky_models.AppBskyFeedGetFeed.Params(
+                    feed="at://did:plc:public/app.bsky.feed.generator/popular", limit=max(10, limit)
+                )
+                feed = self._client.app.bsky.feed.get_feed(params)
+                items = getattr(feed, "feed", []) or []
+            except Exception:
+                params = bsky_models.AppBskyFeedGetTimeline.Params(limit=max(10, limit))
+                feed = self._client.app.bsky.feed.get_timeline(params)
+                items = getattr(feed, "feed", []) or []
+            texts: List[str] = []
+            for it in items:
+                post = getattr(it, "post", None)
+                record = getattr(post, "record", None)
+                text = getattr(record, "text", "") if record else ""
+                if text:
+                    texts.append(text)
+                if len(texts) >= max(1, limit):
+                    break
+            return texts
+        except Exception:
+            return []
 
     def _load_recent_authors(self) -> None:
         try:
@@ -109,11 +446,131 @@ class BskyBot:
                     self._replied_uris.remove(old)
         self._save_replied_log()
 
+    def _create_url_facets(self, text: str) -> Optional[List]:
+        """Create facets for URLs in the text to make them clickable.
+        
+        Returns a list of facet objects or None if no URLs found.
+        """
+        try:
+            import re
+            # Find all URLs in the text
+            url_pattern = re.compile(r'https?://[^\s]+')
+            urls = url_pattern.findall(text)
+            
+            if not urls:
+                return None
+            
+            facets = []
+            for url in urls:
+                # Find the start and end positions of the URL in the text
+                start = text.find(url)
+                if start != -1:
+                    end = start + len(url)
+                    # Create a facet for this URL
+                    facet = bsky_models.AppBskyRichtextFacet.Main(
+                        index=bsky_models.AppBskyRichtextFacet.ByteSlice(
+                            byteStart=start,
+                            byteEnd=end
+                        ),
+                        features=[
+                            bsky_models.AppBskyRichtextFacet.Link(
+                                uri=url
+                            )
+                        ]
+                    )
+                    facets.append(facet)
+            
+            logger.debug("Bsky: created {} URL facets", len(facets))
+            return facets if facets else None
+            
+        except Exception as exc:
+            logger.warning("Bsky: failed to create URL facets: {}", exc)
+            return None
+
+    def _create_external_embed(self, text: str) -> Optional[Any]:
+        """Create an external embed for URLs in the text to generate rich link previews.
+        
+        Returns an AppBskyEmbedExternal object or None if no URLs found.
+        """
+        try:
+            import re
+            # Find the first URL in the text
+            url_pattern = re.compile(r'https?://[^\s]+')
+            urls = url_pattern.findall(text)
+            
+            if not urls:
+                return None
+            
+            # Use the first URL found
+            url = urls[0]
+            logger.debug("Bsky: creating external embed for URL: {}", url)
+            
+            # Fetch URL metadata
+            title, description = self._fetch_url_metadata(url)
+            
+            # Create external embed
+            external_embed = bsky_models.AppBskyEmbedExternal.Main(
+                external=bsky_models.AppBskyEmbedExternal.External(
+                    uri=url,
+                    title=title or "Link",
+                    description=description or ""
+                )
+            )
+            
+            logger.debug("Bsky: created external embed with title: '{}'", title)
+            return external_embed
+            
+        except Exception as exc:
+            logger.warning("Bsky: failed to create external embed: {}", exc)
+            return None
+
+    def _fetch_url_metadata(self, url: str) -> tuple[Optional[str], Optional[str]]:
+        """Fetch title and description from a URL for embed metadata."""
+        try:
+            from .utils import fetch_and_extract_readable_text
+            title, text = fetch_and_extract_readable_text(url, timeout=8)
+            
+            # Clean up the title
+            if title and len(title) > 100:
+                title = title[:97] + "..."
+            
+            # Extract a description from the text
+            description = None
+            if text:
+                # Take first paragraph or first 200 chars
+                lines = text.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if len(line) > 50:  # Skip very short lines
+                        description = line[:200]
+                        if len(line) > 200:
+                            description += "..."
+                        break
+            
+            return title, description
+            
+        except Exception as exc:
+            logger.warning("Bsky: failed to fetch URL metadata for {}: {}", url, exc)
+            return None, None
+
     # Posting
     def create_post(self, text: str) -> bool:
         try:
-            self._client.send_post(text=text)
-            logger.info("Bsky: posted ({} chars)", len(text))
+            # Enforce Bluesky max graphemes (hard limit is 300)
+            max_len = min(300, max(1, int(getattr(self._config, "bsky_post_max_chars", 300))))
+            safe_text = text if len(text) <= max_len else (text[: max_len - 1] + "…")
+            
+            # Check if the post contains a URL and create external embed
+            embed = self._create_external_embed(safe_text)
+            
+            if embed:
+                # Use external embed for rich link preview
+                self._client.send_post(text=safe_text, embed=embed)
+                logger.info("Bsky: posted with external embed ({} chars)", len(text))
+            else:
+                # Regular post without URLs
+                self._client.send_post(text=safe_text)
+                logger.info("Bsky: posted ({} chars)", len(text))
             return True
         except Exception as exc:
             logger.error("Bsky: failed to post: {}", exc)
@@ -134,9 +591,11 @@ class BskyBot:
                 return None
             # Build candidate list, then choose randomly to diversify
             candidates: List[Dict[str, Any]] = []
+            relaxed_candidates: List[Dict[str, Any]] = []
             now_s = time.time()
             # prune expired author cooldowns
             self._recent_authors = {a: t for a, t in self._recent_authors.items() if (now_s - t) < self._author_cooldown_s}
+            my_handle_plain = (self._config.bsky_handle or "").lstrip("@")
             for it in items:
                 post = getattr(it, "post", None)
                 record = getattr(post, "record", None)
@@ -144,31 +603,53 @@ class BskyBot:
                 if text and len(text.strip()) >= max(1, int(getattr(self._config, "bsky_min_text_len", 10))):
                     uri = getattr(post, "uri", None)
                     cid = getattr(post, "cid", None)
-                    author = getattr(getattr(post, "author", None), "handle", None)
-                    # Skip if we've already replied to this post
-                    if uri and uri in self._replied_uris:
+                    author_obj = getattr(post, "author", None)
+                    author = getattr(author_obj, "handle", None)
+                    author_did = getattr(author_obj, "did", None)
+                    viewer = getattr(author_obj, "viewer", None)
+                    is_following = bool(getattr(viewer, "following", None)) if viewer else False
+                    # Skip posts authored by ourselves (never reply to own posts)
+                    if author and my_handle_plain and author.lower() == my_handle_plain.lower():
+                        logger.info("Bsky: skipping own post (author matched) uri={}", uri)
                         continue
+                    # Skip if we've already replied to this post
+                    already_replied_this = bool(uri and uri in self._replied_uris)
                     if not uri or not cid:
                         continue
                     # Skip recently replied-to authors (cooldown)
-                    if author and author in self._recent_authors:
-                        continue
+                    recent_author = bool(author and author in self._recent_authors)
                     # If this is a reply, try to find the root and skip if we've replied to that root recently
                     try:
                         thread_ctx = self.get_thread_context(uri)
                         root_uri = None
                         if thread_ctx and thread_ctx.get("root_post", {}).get("uri"):
                             root_uri = thread_ctx["root_post"]["uri"]
-                            if root_uri in self._replied_uris:
+                            root_already_replied = bool(root_uri in self._replied_uris)
+                            # Also skip threads where the root author is ourselves (never reply to own thread)
+                            root_author = (thread_ctx.get("root_post", {}) or {}).get("author") or ""
+                            if my_handle_plain and root_author.lstrip("@").lower() == my_handle_plain.lower():
+                                logger.info("Bsky: skipping thread (root authored by self) root_uri={}", root_uri)
                                 continue
                     except Exception:
                         thread_ctx = None
                         root_uri = None
+                    # Parse createdAt to epoch seconds for recency weighting
+                    created_at_raw = getattr(record, "created_at", None) or getattr(record, "createdAt", None)
+                    created_ts: Optional[float] = None
+                    try:
+                        if isinstance(created_at_raw, str) and created_at_raw:
+                            iso = created_at_raw.replace("Z", "+00:00")
+                            created_ts = datetime.fromisoformat(iso).astimezone(timezone.utc).timestamp()
+                    except Exception:
+                        created_ts = None
+
                     ctx: Dict[str, Any] = {
                         "text": text,
                         "author": f"@{author}" if author else None,
                         "uri": uri,
                         "cid": cid,
+                        "author_did": author_did,
+                        "is_following": is_following,
                     }
                     # Try to extract quoted post (if this is a quote)
                     try:
@@ -182,8 +663,15 @@ class BskyBot:
                         external_url = self._extract_external_url_from_post_view(post)
                         if external_url:
                             ctx["urls"] = [external_url]
+                            ctx["original_has_url"] = True
+                        else:
+                            # Also mark if text itself has a URL-like substring
+                            if "http://" in text or "https://" in text:
+                                ctx["original_has_url"] = True
                     except Exception:
-                        pass
+                        # Basic heuristic from text
+                        if "http://" in text or "https://" in text:
+                            ctx["original_has_url"] = True
                     # Include thread, quoted, and external link context if present
                     if thread_ctx and thread_ctx.get("root_post"):
                         ctx.update({
@@ -200,8 +688,235 @@ class BskyBot:
                         external_url = self._extract_external_url_from_post_view(post)
                         if external_url:
                             ctx["urls"] = [external_url]
+                            ctx["original_has_url"] = True
+                        else:
+                            if "http://" in text or "https://" in text:
+                                ctx["original_has_url"] = True
+                    except Exception:
+                        if "http://" in text or "https://" in text:
+                            ctx["original_has_url"] = True
+                    item_obj = {
+                        "uri": uri,
+                        "cid": cid,
+                        "author": author,
+                        "root_uri": root_uri,
+                        "ctx": ctx,
+                        "text": text,
+                        "created_ts": created_ts,
+                        "is_following": is_following,
+                    }
+                    # Strict pool: only if not recently replied and not root duplicate
+                    if not recent_author and not root_already_replied and not already_replied_this:
+                        candidates.append(item_obj)
+                    # Relaxed pool: allow recent/root duplicates to avoid empty selections
+                    relaxed_candidates.append(item_obj)
+            if not candidates:
+                logger.warning("Bsky: no suitable post found in timeline; trying relaxed selection")
+                if not relaxed_candidates:
+                    return None
+                pick_from = relaxed_candidates[: min(self._candidate_pool_size, len(relaxed_candidates))]
+            else:
+                # Randomize among first N candidates to diversify
+                pick_from = candidates[: min(self._candidate_pool_size, len(candidates))]
+            # If we already follow the author, bias to more recent posts but keep older possible
+            try:
+                followed_present = any(bool(c.get("is_following")) for c in pick_from)
+            except Exception:
+                followed_present = False
+            if followed_present:
+                now_ts = time.time()
+                half_life_hours = 6.0  # bias toward last ~6h for followed authors
+                weights: List[float] = []
+                for c in pick_from:
+                    ts = c.get("created_ts")
+                    if isinstance(ts, (int, float)) and ts > 0:
+                        age_h = max(0.0, (now_ts - ts) / 3600.0)
+                    else:
+                        age_h = 48.0  # treat unknown as old
+                    w = math.exp(-age_h / half_life_hours)
+                    weights.append(w)
+                # Normalize and sample
+                total = sum(weights) or 1.0
+                r = random.random() * total
+                acc = 0.0
+                chosen = pick_from[-1]
+                for idx, w in enumerate(weights):
+                    acc += w
+                    if r <= acc:
+                        chosen = pick_from[idx]
+                        break
+                logger.info("Bsky: recency-weighted pick among followed authors (half-life {}h)", half_life_hours)
+            else:
+                chosen = random.choice(pick_from)
+            uri = chosen["uri"]
+            cid = chosen["cid"]
+            author = chosen.get("author")
+            root_uri = chosen.get("root_uri")
+            ctx = chosen["ctx"]
+            self._current_post_context = ctx
+            self._reply_target = {
+                "uri": uri,
+                "cid": cid,
+                "root_uri": root_uri,
+                "author_handle": author,
+                "author_did": chosen.get("author_did"),
+                "reply_ref": bsky_models.AppBskyFeedPost.ReplyRef(
+                    root=bsky_models.ComAtprotoRepoStrongRef.Main(uri=uri, cid=cid),
+                    parent=bsky_models.ComAtprotoRepoStrongRef.Main(uri=uri, cid=cid),
+                ),
+            }
+            logger.info("Bsky: prepared reply target uri={} cid={} text='{}'", uri, cid, str(chosen["text"])[:120])
+            # Context flags/logs (compact)
+            has_url = bool(ctx.get("original_has_url"))
+            urls = ", ".join((ctx.get("urls") or [])[:2]) or "-"
+            qp = "yes" if ctx.get("quoted_post") else "no"
+            td = ctx.get("thread_depth") or 1
+            logger.info("Bsky: context flags: original_has_url={} urls=[{}] quoted_post={} thread_depth={}", has_url, urls, qp, td)
+            return chosen["text"]
+            logger.warning("Bsky: no suitable post found in timeline")
+            return None
+        except Exception as exc:
+            logger.error("Bsky: failed to prepare reply from timeline: {}", exc)
+            return None
+
+    def prepare_reply_from_discover(self) -> Optional[str]:
+        """Fetch a Discover-like feed (e.g., `get_feed` or `get_timeline` algorithmic) and pick a candidate.
+
+        Falls back to timeline if the Discover endpoint is unavailable.
+        """
+        try:
+            # 1/3 chance: try explore trending topics (top 5) and sample items from one of them
+            try:
+                if random.random() < (1.0 / 3.0):
+                    # Some clients expose app.bsky.feed.get_trending_topics (hypothetical). If not, use popular generator.
+                    # We approximate by using the popular generator feed as a proxy and extracting top hashtags/phrases.
+                    params_pop = bsky_models.AppBskyFeedGetFeed.Params(feed="at://did:plc:public/app.bsky.feed.generator/popular", limit=50)
+                    pop = self._client.app.bsky.feed.get_feed(params_pop)
+                    pitems: List[Any] = getattr(pop, "feed", []) or []
+                    # Extract up to 5 trending-like terms (hashtags or frequent capitalized phrases)
+                    texts: List[str] = []
+                    for it in pitems[:50]:
+                        rec = getattr(getattr(it, 'post', None), 'record', None)
+                        t = getattr(rec, 'text', '') if rec else ''
+                        if t:
+                            texts.append(t)
+                    # Naive trending extraction
+                    terms: Dict[str, int] = {}
+                    for t in texts:
+                        for m in re.findall(r"#[A-Za-z][A-Za-z0-9_]{2,}", t):
+                            terms[m.lower()] = terms.get(m.lower(), 0) + 1
+                    # Fallback: frequent Title Case words
+                    if not terms:
+                        for t in texts:
+                            for m in re.findall(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b", t):
+                                terms[m] = terms.get(m, 0) + 1
+                    top5 = sorted(terms.items(), key=lambda kv: kv[1], reverse=True)[:5]
+                    if top5:
+                        chosen_term = random.choice(top5)[0]
+                        logger.info("Bsky: explore trending proxy chose term='{}' from top5", chosen_term)
+                        # Filter feed items that contain the chosen term
+                        filtered: List[Any] = []
+                        for it in pitems:
+                            rec = getattr(getattr(it, 'post', None), 'record', None)
+                            t = getattr(rec, 'text', '') if rec else ''
+                            if t and chosen_term and chosen_term.lower() in t.lower():
+                                filtered.append(it)
+                        if filtered:
+                            items = filtered
+                        else:
+                            items = pitems
+                    else:
+                        items = pitems
+                else:
+                    items = None  # continue below
+            except Exception:
+                items = None
+            try:
+                # Attempt to use Discover/Popular feed if available in atproto client
+                params = bsky_models.AppBskyFeedGetFeed.Params(feed="at://did:plc:public/app.bsky.feed.generator/popular", limit=50)
+                feed = self._client.app.bsky.feed.get_feed(params)
+                items = items if items is not None else (getattr(feed, "feed", []) or [])
+            except Exception:
+                # Fallback: use timeline (algorithmic) as a proxy for Discover
+                params = bsky_models.AppBskyFeedGetTimeline.Params(limit=50)
+                feed = self._client.app.bsky.feed.get_timeline(params)
+                items = items if items is not None else (getattr(feed, "feed", []) or [])
+            if not items:
+                logger.warning("Bsky: discover feed empty")
+                return None
+            # Reuse same candidate construction as timeline
+            candidates: List[Dict[str, Any]] = []
+            now_s = time.time()
+            self._recent_authors = {a: t for a, t in self._recent_authors.items() if (now_s - t) < self._author_cooldown_s}
+            my_handle_plain = (self._config.bsky_handle or "").lstrip("@")
+            for it in items:
+                post = getattr(it, "post", None)
+                record = getattr(post, "record", None)
+                text = getattr(record, "text", "") if record else ""
+                if text and len(text.strip()) >= max(1, int(getattr(self._config, "bsky_min_text_len", 10))):
+                    uri = getattr(post, "uri", None)
+                    cid = getattr(post, "cid", None)
+                    author_obj = getattr(post, "author", None)
+                    author = getattr(author_obj, "handle", None)
+                    author_did = getattr(author_obj, "did", None)
+                    viewer = getattr(author_obj, "viewer", None)
+                    is_following = bool(getattr(viewer, "following", None)) if viewer else False
+                    # Skip posts authored by ourselves
+                    if author and my_handle_plain and author.lower() == my_handle_plain.lower():
+                        logger.info("Bsky: skipping own post (author matched) uri={}", uri)
+                        continue
+                    if uri and uri in self._replied_uris:
+                        continue
+                    if not uri or not cid:
+                        continue
+                    if author and author in self._recent_authors:
+                        continue
+                    # Thread/root dedupe
+                    try:
+                        thread_ctx = self.get_thread_context(uri)
+                        root_uri = None
+                        if thread_ctx and thread_ctx.get("root_post", {}).get("uri"):
+                            root_uri = thread_ctx["root_post"]["uri"]
+                            if root_uri in self._replied_uris:
+                                continue
+                            # Skip if the root author is ourselves
+                            root_author = (thread_ctx.get("root_post", {}) or {}).get("author") or ""
+                            if my_handle_plain and root_author.lstrip("@").lower() == my_handle_plain.lower():
+                                logger.info("Bsky: skipping thread (root authored by self) root_uri={}", root_uri)
+                                continue
+                    except Exception:
+                        thread_ctx = None
+                        root_uri = None
+                    ctx: Dict[str, Any] = {
+                        "text": text,
+                        "author": f"@{author}" if author else None,
+                        "uri": uri,
+                        "cid": cid,
+                        "author_did": author_did,
+                        "is_following": is_following,
+                    }
+                    try:
+                        quoted = self._extract_quoted_from_post_view(post)
+                        if quoted:
+                            ctx["quoted_post"] = quoted
                     except Exception:
                         pass
+                    try:
+                        external_url = self._extract_external_url_from_post_view(post)
+                        if external_url:
+                            ctx["urls"] = [external_url]
+                            ctx["original_has_url"] = True
+                        else:
+                            if "http://" in text or "https://" in text:
+                                ctx["original_has_url"] = True
+                    except Exception:
+                        if "http://" in text or "https://" in text:
+                            ctx["original_has_url"] = True
+                    if thread_ctx and thread_ctx.get("root_post"):
+                        ctx.update({
+                            "root_post": thread_ctx["root_post"],
+                            "thread_depth": thread_ctx.get("thread_depth", 1),
+                        })
                     candidates.append({
                         "uri": uri,
                         "cid": cid,
@@ -209,11 +924,12 @@ class BskyBot:
                         "root_uri": root_uri,
                         "ctx": ctx,
                         "text": text,
+                        "author_did": author_did,
+                        "is_following": is_following,
                     })
             if not candidates:
-                logger.warning("Bsky: no suitable post found in timeline")
+                logger.warning("Bsky: no suitable post found in discover")
                 return None
-            # Randomize among first N candidates to diversify
             pick_from = candidates[: min(self._candidate_pool_size, len(candidates))]
             chosen = random.choice(pick_from)
             uri = chosen["uri"]
@@ -227,29 +943,36 @@ class BskyBot:
                 "cid": cid,
                 "root_uri": root_uri,
                 "author_handle": author,
+                "author_did": chosen.get("author_did"),
                 "reply_ref": bsky_models.AppBskyFeedPost.ReplyRef(
                     root=bsky_models.ComAtprotoRepoStrongRef.Main(uri=uri, cid=cid),
                     parent=bsky_models.ComAtprotoRepoStrongRef.Main(uri=uri, cid=cid),
                 ),
             }
-            logger.info("Bsky: prepared reply target uri={} cid={} text='{}'", uri, cid, str(chosen["text"])[:120])
+            logger.info("Bsky: prepared discover reply target uri={} cid={} text='{}'", uri, cid, str(chosen["text"])[:120])
+            has_url = bool(ctx.get("original_has_url"))
+            urls = ", ".join((ctx.get("urls") or [])[:2]) or "-"
+            qp = "yes" if ctx.get("quoted_post") else "no"
+            td = ctx.get("thread_depth") or 1
+            logger.info("Bsky: discover context flags: original_has_url={} urls=[{}] quoted_post={} thread_depth={}", has_url, urls, qp, td)
             return chosen["text"]
-            logger.warning("Bsky: no suitable post found in timeline")
-            return None
         except Exception as exc:
-            logger.error("Bsky: failed to prepare reply from timeline: {}", exc)
+            logger.error("Bsky: failed to prepare reply from discover: {}", exc)
             return None
 
     def get_current_post_context(self) -> Optional[dict]:
         return self._current_post_context
 
     def get_thread_context(self, post_uri: str) -> Optional[Dict[str, Any]]:
-        """Get the full thread context including the root post.
+        """Get expanded thread context for a given post URI.
         
         Returns a dictionary with:
-        - root_post: The original post at the top of the thread
-        - current_post: The post we're replying to
-        - thread_depth: Number of levels in the thread
+        - root_post: dict with text, author, uri
+        - current_post: the post we're replying to
+        - thread_depth: depth from root to current
+        - ancestors: up to 3 ancestor posts above current (nearest first)
+        - sibling_replies: up to 4 sibling replies to the same parent
+        - child_replies: up to 2 immediate replies to the current post
         """
         try:
             # Get the thread using the AT Protocol API
@@ -268,15 +991,21 @@ class BskyBot:
                 logger.warning("Bsky: could not find root post in thread")
                 return None
             
-            # Extract root post information
-            root_record = getattr(root_post, 'record', None)
+            # Extract root post information (handle both ThreadViewPost and PostView shapes)
+            root_post_like = getattr(root_post, 'post', root_post)
+            root_record = getattr(root_post_like, 'record', None)
             root_text = getattr(root_record, 'text', '') if root_record else ''
-            root_author = getattr(getattr(root_post, 'author', None), 'handle', None)
-            root_uri = getattr(root_post, 'uri', None)
+            root_author = getattr(getattr(root_post_like, 'author', None), 'handle', None)
+            root_uri = getattr(root_post_like, 'uri', None)
             
             # Count thread depth
             thread_depth = self._count_thread_depth(thread)
-            
+
+            # Expand context: ancestors, siblings, and children
+            ancestors = self._collect_ancestors(thread, limit=3)
+            sibling_replies = self._collect_sibling_replies(thread, limit=4)
+            child_replies = self._collect_child_replies(thread, limit=2)
+
             context = {
                 'root_post': {
                     'text': root_text,
@@ -285,10 +1014,27 @@ class BskyBot:
                 },
                 'current_post': self._current_post_context,
                 'thread_depth': thread_depth,
+                'ancestors': ancestors,
+                'sibling_replies': sibling_replies,
+                'child_replies': child_replies,
             }
             
-            logger.info("Bsky: gathered thread context - root: '{}', depth: {}", 
-                       root_text[:100], thread_depth)
+            # Verbose summary (compact)
+            anc_count = len(ancestors)
+            sib_count = len(sibling_replies)
+            child_count = len(child_replies)
+            anc_sample = (ancestors[0].get('text') or '')[:100] if anc_count else ''
+            sib_sample = (sibling_replies[0].get('text') or '')[:100] if sib_count else ''
+            logger.info(
+                "Bsky: thread ctx: depth={} root='{}' | ancestors={} first='{}' | siblings={} first='{}' | children={}",
+                thread_depth,
+                root_text[:100],
+                anc_count,
+                anc_sample,
+                sib_count,
+                sib_sample,
+                child_count,
+            )
             return context
             
         except Exception as exc:
@@ -363,6 +1109,167 @@ class BskyBot:
             logger.warning("Bsky: error counting thread depth: {}", exc)
             return 1  # Return 1 as fallback
 
+    def _post_view_to_dict(self, node_like: Any) -> Dict[str, Any]:
+        """Extract minimal fields from a ThreadViewPost or PostView into a plain dict.
+
+        Supports both shapes by checking for a nested 'post'.
+        """
+        try:
+            post = getattr(node_like, 'post', node_like)
+            record = getattr(post, 'record', None)
+            text = getattr(record, 'text', '') if record else ''
+            author = getattr(getattr(post, 'author', None), 'handle', None)
+            uri = getattr(post, 'uri', None)
+            cid = getattr(post, 'cid', None)
+            return {
+                'text': text or '',
+                'author': f"@{author}" if author else None,
+                'uri': uri,
+                'cid': cid,
+            }
+        except Exception:
+            return {'text': '', 'author': None, 'uri': None, 'cid': None}
+
+    def _collect_ancestors(self, thread_node: Any, limit: int = 3) -> List[Dict[str, Any]]:
+        """Walk up the parent chain and collect up to `limit` ancestor posts (nearest first)."""
+        collected: List[Dict[str, Any]] = []
+        try:
+            current = thread_node
+            while len(collected) < max(0, limit):
+                parent_node = getattr(current, 'parent', None)
+                if not parent_node and hasattr(current, 'reply') and current.reply and hasattr(current.reply, 'parent'):
+                    # Fetch parent via URI if only a reference is available
+                    parent_uri = getattr(current.reply.parent, 'uri', None)
+                    if parent_uri:
+                        try:
+                            params = bsky_models.AppBskyFeedGetPostThread.Params(uri=parent_uri)
+                            parent_response = self._client.app.bsky.feed.get_post_thread(params)
+                            parent_node = getattr(parent_response, 'thread', None)
+                        except Exception:
+                            parent_node = None
+                if not parent_node:
+                    break
+                try:
+                    collected.append(self._post_view_to_dict(parent_node))
+                except Exception:
+                    pass
+                current = parent_node
+        except Exception:
+            pass
+        return collected
+
+    def _collect_sibling_replies(self, thread_node: Any, limit: int = 4) -> List[Dict[str, Any]]:
+        """Collect up to `limit` sibling replies to the same parent as the current node."""
+        results: List[Dict[str, Any]] = []
+        try:
+            parent_node = getattr(thread_node, 'parent', None)
+            if not parent_node and hasattr(thread_node, 'reply') and thread_node.reply and hasattr(thread_node.reply, 'parent'):
+                parent_uri = getattr(thread_node.reply.parent, 'uri', None)
+                if parent_uri:
+                    try:
+                        params = bsky_models.AppBskyFeedGetPostThread.Params(uri=parent_uri)
+                        parent_response = self._client.app.bsky.feed.get_post_thread(params)
+                        parent_node = getattr(parent_response, 'thread', None)
+                    except Exception:
+                        parent_node = None
+            if not parent_node:
+                return results
+            replies = getattr(parent_node, 'replies', None) or []
+            # Exclude current node by URI
+            cur_post = getattr(thread_node, 'post', thread_node)
+            cur_uri = getattr(cur_post, 'uri', None)
+            for r in replies:
+                try:
+                    post_like = getattr(r, 'post', r)
+                    r_uri = getattr(post_like, 'uri', None)
+                    if cur_uri and r_uri and r_uri == cur_uri:
+                        continue
+                    d = self._post_view_to_dict(post_like)
+                    if d.get('text') or d.get('uri'):
+                        results.append(d)
+                except Exception:
+                    continue
+            return results[: max(0, limit)]
+        except Exception:
+            return results
+
+    def _collect_child_replies(self, thread_node: Any, limit: int = 2) -> List[Dict[str, Any]]:
+        """Collect a small sample of immediate child replies to the current node."""
+        results: List[Dict[str, Any]] = []
+        try:
+            replies = getattr(thread_node, 'replies', None) or []
+            for r in replies[: max(0, limit)]:
+                try:
+                    post_like = getattr(r, 'post', r)
+                    results.append(self._post_view_to_dict(post_like))
+                except Exception:
+                    continue
+        except Exception:
+            return results
+        return results
+
+    def like_some_thread_replies(self, thread_ctx: Optional[Dict[str, Any]], max_likes: int = 5) -> None:
+        """Randomly like up to `max_likes` replies from the visible thread context with human-like delays.
+
+        Picks from sibling_replies and child_replies. Waits 5–10 seconds between likes.
+        Safe to call when no thread context is present.
+        """
+        try:
+            if not thread_ctx:
+                return
+            candidates: List[Dict[str, Any]] = []
+            for key in ("sibling_replies", "child_replies"):
+                items = thread_ctx.get(key) or []
+                for it in items:
+                    uri = it.get('uri')
+                    if uri:
+                        candidates.append(it)
+            if not candidates:
+                return
+            # Deduplicate by uri
+            seen: set[str] = set()
+            uniq: List[Dict[str, Any]] = []
+            for it in candidates:
+                u = it.get('uri')
+                if u and u not in seen:
+                    seen.add(u)
+                    uniq.append(it)
+            if not uniq:
+                return
+            # Choose random count up to max_likes and available size
+            import random as _random
+            import time as _time
+            like_count = _random.randint(0, min(max_likes, len(uniq)))
+            if like_count <= 0:
+                return
+            _random.shuffle(uniq)
+            to_like = uniq[:like_count]
+            logger.info("Bsky: will like {} thread reply(ies)", like_count)
+            for idx, it in enumerate(to_like, start=1):
+                uri = it.get('uri')
+                cid = it.get('cid')
+                author = it.get('author') or ''
+                try:
+                    # Try like by uri; fall back to (uri, cid)
+                    try:
+                        self._client.like(uri)  # some client versions accept uri only
+                    except Exception:
+                        if cid:
+                            self._client.like(uri, cid)
+                        else:
+                            raise
+                    logger.info("Bsky: liked reply {}/{} uri={} author={}", idx, like_count, uri, author)
+                except Exception as exc:
+                    logger.warning("Bsky: failed to like uri={} : {}", uri, exc)
+                # Human-like pause 5–10s between likes
+                if idx < like_count:
+                    pause = _random.uniform(5.0, 10.0)
+                    logger.info("Bsky: waiting {:.1f}s before next like", pause)
+                    _time.sleep(pause)
+        except Exception:
+            # Swallow errors to avoid impacting main flow
+            return
+
     def send_prepared_reply(self, text: str) -> bool:
         if not self._reply_target:
             logger.warning("Bsky: send_prepared_reply called without target")
@@ -376,8 +1283,17 @@ class BskyBot:
                     root=bsky_models.ComAtprotoRepoStrongRef.Main(uri=uri, cid=cid),
                     parent=bsky_models.ComAtprotoRepoStrongRef.Main(uri=uri, cid=cid),
                 )
-            self._client.send_post(text=text, reply_to=reply_ref)
-            logger.info("Bsky: replied ({} chars)", len(text))
+            # Check if the reply contains URLs and create external embed
+            embed = self._create_external_embed(text)
+            
+            if embed:
+                # Use external embed for rich link preview in replies
+                self._client.send_post(text=text, reply_to=reply_ref, embed=embed)
+                logger.info("Bsky: replied with external embed ({} chars)", len(text))
+            else:
+                # Regular reply without URLs
+                self._client.send_post(text=text, reply_to=reply_ref)
+                logger.info("Bsky: replied ({} chars)", len(text))
             try:
                 # Record current post URI and root URI to avoid thread repeats
                 self._record_replied(self._reply_target.get("uri"))
@@ -390,6 +1306,24 @@ class BskyBot:
                     self._recent_authors[author] = time.time()
                     # Persist
                     self._save_recent_authors()
+                # Opportunistic follow with 50% chance if not already following
+                try:
+                    if random.random() < 0.5:
+                        author_did = self._reply_target.get("author_did")
+                        already_following = False
+                        try:
+                            # If we have viewer info in context, prefer it
+                            already_following = bool((self._current_post_context or {}).get("is_following"))
+                        except Exception:
+                            pass
+                        if author_did and not already_following:
+                            try:
+                                self._client.follow(author_did)
+                                logger.info("Bsky: followed author did={} handle={}", author_did, author)
+                            except Exception as exc:
+                                logger.warning("Bsky: failed to follow did={}: {}", author_did, exc)
+                except Exception:
+                    pass
             except Exception:
                 pass
             return True

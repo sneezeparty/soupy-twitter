@@ -73,6 +73,11 @@ class AppConfig:
     bsky_reply_max_chars: int
     bsky_post_max_chars: int
 
+    # Daily Bluesky news post
+    daily_post_enabled: bool
+    daily_post_hour: int  # 0-23 local time
+    daily_post_window_minutes: int  # fire within +/- window
+
     # LLM/temperature controls
     llm_reply_temperature: float
     llm_post_temperature: float
@@ -104,7 +109,7 @@ class AppConfig:
             x_api_access_token=os.getenv("X_API_ACCESS_TOKEN"),
             x_api_access_token_secret=os.getenv("X_API_ACCESS_TOKEN_SECRET"),
             x_api_bearer_token=os.getenv("X_API_BEARER_TOKEN"),
-            behaviour_prompt=os.getenv("BEHAVIOUR", "You are a helpful, friendly Twitter user."),
+            behaviour_prompt=os.getenv("BEHAVIOUR", "You are a helpful, friendly user."),
             captcha_api_key=os.getenv("CAPTCHA_API_KEY"),
             headless=cls._get_bool(os.getenv("HEADLESS", "false"), default=False),
             actions_per_hour_cap=int(os.getenv("ACTIONS_PER_HOUR_CAP", "4")),
@@ -137,7 +142,11 @@ class AppConfig:
             bsky_replied_log_max=int(os.getenv("BSKY_REPLIED_LOG_MAX", "1000")),
             bsky_min_text_len=int(os.getenv("BSKY_MIN_TEXT_LEN", "10")),
             bsky_reply_max_chars=int(os.getenv("BSKY_REPLY_MAX_CHARS", "360")),
-            bsky_post_max_chars=int(os.getenv("BSKY_POST_MAX_CHARS", "500")),
+            bsky_post_max_chars=int(os.getenv("BSKY_POST_MAX_CHARS", "300")),
+            # Daily Bluesky news post
+            daily_post_enabled=cls._get_bool(os.getenv("DAILY_POST_ENABLED", "true"), default=True),
+            daily_post_hour=int(os.getenv("DAILY_POST_HOUR", "14")),
+            daily_post_window_minutes=int(os.getenv("DAILY_POST_WINDOW_MINUTES", "45")),
             # LLM temps
             llm_reply_temperature=float(os.getenv("LLM_REPLY_TEMPERATURE", "0.7")),
             llm_post_temperature=float(os.getenv("LLM_POST_TEMPERATURE", "0.85")),

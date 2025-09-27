@@ -93,3 +93,31 @@ def fetch_and_extract_readable_text(url: str, timeout: int = 8) -> tuple[str, st
     logger.info("Fetch: parsed '{}' ({} chars extracted)", title, len(excerpt))
     return (title, excerpt)
 
+
+def shorten_url_tinyurl(long_url: str, timeout: int = 6) -> str:
+    """Shorten a URL using TinyURL API. Returns original on failure.
+
+    API: https://tinyurl.com/api-create.php?url=<long>
+    """
+    if not long_url or not long_url.strip():
+        logger.warning("TinyURL: empty URL provided")
+        return long_url
+    
+    try:
+        api = "https://tinyurl.com/api-create.php"
+        resp = requests.get(api, params={"url": long_url.strip()}, timeout=timeout)
+        if resp.status_code == 200:
+            short = resp.text.strip()
+            # Validate the response is actually a URL
+            if short.startswith("http") and len(short) > 10 and "." in short:
+                logger.info("TinyURL: shortened {} -> {}", long_url, short)
+                return short
+            else:
+                logger.warning("TinyURL: invalid response format: '{}'", short)
+        else:
+            logger.warning("TinyURL: failed status {} for {}", resp.status_code, long_url)
+    except Exception as exc:
+        logger.warning("TinyURL: error for {} => {}", long_url, exc)
+    
+    logger.info("TinyURL: falling back to original URL: {}", long_url)
+    return long_url
