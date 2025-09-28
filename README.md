@@ -1,17 +1,22 @@
 # Soupy Bluesky Bot
 
-An intelligent social media bot powered by LM Studio that generates contextual posts and replies. Primarily designed for Bluesky with advanced features like thread context analysis, URL enrichment, and smart content curation.
+An LLM‑powered Bluesky autoposter and auto‑replier. It runs on your schedule, reads your Bluesky feeds, and automatically:
+- Replies to posts with tight, tone‑matched, context‑aware messages
+- Posts original updates (e.g., daily news summaries with a link preview)
+
+Under the hood, it uses a local LLM (LM Studio/OpenAI‑compatible) plus thread context, URL summaries, and lightweight web search to stay grounded and relevant.
 
 ## Overview
 
 Soupy Bot uses local LLM models via LM Studio to create human-like social media content. It intelligently analyzes posts, extracts context from linked articles, and generates relevant responses. The bot is optimized for Bluesky's AT Protocol API with comprehensive thread understanding and content enrichment.
 
-### Highlights
+### What it does (at a glance)
 - Bluesky-only: the codebase removes Twitter/X integrations.
-- Assertive, tone-matched replies with strict length control and hedging reduction.
-- Reply targeting policy: 70% top-level (root) and 30% first-level replies on Bluesky.
-- Variability improvements: shuffled candidate pools, recency weighting for followed authors, author cooldowns, and thread/root deduping.
-- URL enrichment with rich embeds and a drift guard to prevent off-topic web search (e.g., speculative science when not present in the post).
+- Automatically replies with assertive, tone‑matched texts and strict length control (no hedging)
+- Automatically posts daily news commentary with one link (rich preview + URL facets)
+- 70/30 reply targeting: 70% to the root post, 30% to a first‑level reply
+- Variability: shuffled candidate pools, recency weighting, author cooldowns, thread/root dedupe
+- Grounding: URL enrichment, thread context, and a drift guard to prevent off‑topic web search
 
 ## Key Features
 
