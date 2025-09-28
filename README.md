@@ -1,10 +1,17 @@
-# Soupy Bot
+# Soupy Bluesky Bot
 
 An intelligent social media bot powered by LM Studio that generates contextual posts and replies. Primarily designed for Bluesky with advanced features like thread context analysis, URL enrichment, and smart content curation.
 
 ## Overview
 
 Soupy Bot uses local LLM models via LM Studio to create human-like social media content. It intelligently analyzes posts, extracts context from linked articles, and generates relevant responses. The bot is optimized for Bluesky's AT Protocol API with comprehensive thread understanding and content enrichment.
+
+### Highlights
+- Bluesky-only: the codebase removes Twitter/X integrations.
+- Assertive, tone-matched replies with strict length control and hedging reduction.
+- Reply targeting policy: 70% top-level (root) and 30% first-level replies on Bluesky.
+- Variability improvements: shuffled candidate pools, recency weighting for followed authors, author cooldowns, and thread/root deduping.
+- URL enrichment with rich embeds and a drift guard to prevent off-topic web search (e.g., speculative science when not present in the post).
 
 ## Key Features
 
@@ -23,9 +30,10 @@ Soupy Bot uses local LLM models via LM Studio to create human-like social media 
 ### 📱 **Bluesky Integration**
 - Full AT Protocol API support (read/write)
 - Thread context gathering and analysis
-- Rich link previews with external embeds
+- 70/30 reply targeting (root vs. first-level)
+- Rich link previews with external embeds and URL facets
 - Author cooldown and deduplication systems
-- Smart post selection from trending/popular feeds
+- Smart post selection from following and popular feeds
 
 ### 🎯 **Smart Content Curation**
 - Diverse seed post selection (author and topic diversity)
@@ -79,8 +87,8 @@ MAX_INTERVAL_MINUTES=30
 python main.py
 
 # Force immediate actions
-python main.py --postnow    # Generate and post daily news
-python main.py --now --reply # Reply to a post immediately
+python main.py --postnow     # Generate and post daily news (Bluesky)
+python main.py --now --reply # Reply to a post immediately (Bluesky)
 ```
 
 ## Usage Modes
@@ -94,14 +102,15 @@ python main.py --now --reply # Reply to a post immediately
 
 ### Reply Mode
 - Reads Bluesky timeline and popular feeds
-- Selects diverse, high-quality posts
+- Selects diverse, high-quality posts with variability improvements
 - Analyzes thread context and conversation history
-- Generates contextual replies with personality
-- Includes URL enrichment when available
+- Generates assertive, tone-matched replies with strict length control
+- 70/30 targeting: reply to root 70% / first-level 30%
+- Includes URL enrichment when available; drift guard prevents off-topic search
 
 ### Content Enrichment
-- **URL Analysis**: Fetches and summarizes linked articles
-- **Web Search**: Derives additional context from web searches
+- **URL Analysis**: Fetches and summarizes linked articles; adds external embed/URL facets
+- **Web Search**: Derives additional context; guarded against off-topic drift
 - **Thread Context**: Understands conversation flow and history
 - **Smart Filtering**: Avoids clickbait and low-quality content
 

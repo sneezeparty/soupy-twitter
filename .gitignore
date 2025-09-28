@@ -17,6 +17,8 @@ soupy.log
 
 # Envs
 .env
+.env.*
+!.env.example
 
 # Playwright
 user_data/
@@ -27,6 +29,13 @@ test-results/
 .vscode/
 .idea/
 soupy-twitter.code-workspace
+.python-version
+
+# Tool caches / coverage
+.ruff_cache/
+.cache/
+.coverage
+coverage.xml
 
 # OS
 .DS_Store

@@ -17,19 +17,7 @@ class AppConfig:
     local_api_key: str
     local_model: str
 
-    # Twitter/X credentials
-    x_username: str
-    x_password: str
-    x_email: Optional[str]
-
-    # X API mode (official API)
-    use_x_api: bool
-    x_api_tier: str  # e.g., "free", "basic", "pro", "enterprise"
-    x_api_consumer_key: Optional[str]
-    x_api_consumer_secret: Optional[str]
-    x_api_access_token: Optional[str]
-    x_api_access_token_secret: Optional[str]
-    x_api_bearer_token: Optional[str]
+    # Removed Twitter/X integration
 
     # Behavior / system prompt
     behaviour_prompt: str
@@ -77,6 +65,10 @@ class AppConfig:
     daily_post_enabled: bool
     daily_post_hour: int  # 0-23 local time
     daily_post_window_minutes: int  # fire within +/- window
+    daily_posts_per_day: int  # number of posts per day
+    daily_post_min_interval_hours: int  # minimum hours between posts
+    daily_post_max_interval_hours: int  # maximum hours between posts
+    daily_post_first_hour: int  # hour for first post of the day
 
     # LLM/temperature controls
     llm_reply_temperature: float
@@ -99,16 +91,7 @@ class AppConfig:
             openai_base_url=os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:5112/v1"),
             local_api_key=os.getenv("LOCAL_KEY", "lm-studio"),
             local_model=os.getenv("LOCAL_CHAT", "Orenguteng/Llama-3-8B-Lexi-Uncensored-GGUF"),
-            x_username=os.getenv("X_USERNAME", ""),
-            x_password=os.getenv("X_PASSWORD", ""),
-            x_email=os.getenv("X_EMAIL"),
-            use_x_api=cls._get_bool(os.getenv("USE_X_API", "true"), default=True),
-            x_api_tier=os.getenv("X_API_TIER", "free"),
-            x_api_consumer_key=os.getenv("X_API_CONSUMER_KEY"),
-            x_api_consumer_secret=os.getenv("X_API_CONSUMER_SECRET"),
-            x_api_access_token=os.getenv("X_API_ACCESS_TOKEN"),
-            x_api_access_token_secret=os.getenv("X_API_ACCESS_TOKEN_SECRET"),
-            x_api_bearer_token=os.getenv("X_API_BEARER_TOKEN"),
+            
             behaviour_prompt=os.getenv("BEHAVIOUR", "You are a helpful, friendly user."),
             captcha_api_key=os.getenv("CAPTCHA_API_KEY"),
             headless=cls._get_bool(os.getenv("HEADLESS", "false"), default=False),
@@ -147,6 +130,10 @@ class AppConfig:
             daily_post_enabled=cls._get_bool(os.getenv("DAILY_POST_ENABLED", "true"), default=True),
             daily_post_hour=int(os.getenv("DAILY_POST_HOUR", "14")),
             daily_post_window_minutes=int(os.getenv("DAILY_POST_WINDOW_MINUTES", "45")),
+            daily_posts_per_day=int(os.getenv("DAILY_POSTS_PER_DAY", "2")),
+            daily_post_min_interval_hours=int(os.getenv("DAILY_POST_MIN_INTERVAL_HOURS", "4")),
+            daily_post_max_interval_hours=int(os.getenv("DAILY_POST_MAX_INTERVAL_HOURS", "8")),
+            daily_post_first_hour=int(os.getenv("DAILY_POST_FIRST_HOUR", "8")),
             # LLM temps
             llm_reply_temperature=float(os.getenv("LLM_REPLY_TEMPERATURE", "0.7")),
             llm_post_temperature=float(os.getenv("LLM_POST_TEMPERATURE", "0.85")),
@@ -161,23 +148,7 @@ class AppConfig:
             # Bluesky requires handle and app password
             if not self.bsky_handle or not self.bsky_app_password:
                 raise ValueError("Missing Bluesky credentials: set BSKY_HANDLE and BSKY_APP_PASSWORD (create an app password in Bluesky settings).")
-        elif self.use_x_api:
-            missing = [
-                k for k, v in {
-                    "X_API_CONSUMER_KEY": self.x_api_consumer_key,
-                    "X_API_CONSUMER_SECRET": self.x_api_consumer_secret,
-                    "X_API_ACCESS_TOKEN": self.x_api_access_token,
-                    "X_API_ACCESS_TOKEN_SECRET": self.x_api_access_token_secret,
-                }.items() if not v
-            ]
-            if missing:
-                raise ValueError(
-                    "Missing X API credentials: " + ", ".join(missing) + 
-                    ". Populate these in .env or set USE_X_API=false to use browser automation."
-                )
-        else:
-            if not self.x_username or not self.x_password:
-                raise ValueError("X_USERNAME and X_PASSWORD must be set in environment.")
+        
         if self.min_interval_minutes < 1 or self.max_interval_minutes < self.min_interval_minutes:
             raise ValueError("Invalid interval minutes. Ensure 1 <= MIN <= MAX.")
         if not (0 <= self.own_posting_probability <= 1):

@@ -4,6 +4,7 @@ import time
 from loguru import logger
 import re
 from typing import List
+import regex as _regex
 import html
 from bs4 import BeautifulSoup
 import requests

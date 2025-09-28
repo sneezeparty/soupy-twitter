@@ -124,9 +124,23 @@ class ContextEnricher:
 
         # Web search enrichment (secondary). If we already summarized a URL, skip adding generic web search to avoid drift.
         if self._config.web_search_enrichment and not url_summary_added:
-            logger.info("Enrichment: deriving brief search context from tweet text")
-            logger.info("Enrichment: tweet excerpt => {}", tweet_text.strip().replace("\n", " ")[:200])
-            search_result = self._search_context(tweet_text, base_context)
+            # Use thread context if available, otherwise fall back to tweet text
+            search_source = self._get_search_context_source(base_context, tweet_text)
+            logger.info("Enrichment: deriving brief search context from {}", search_source["source"])
+            logger.info("Enrichment: search excerpt => {}", search_source["text"].strip().replace("\n", " ")[:200])
+            # Guard: skip generic web search for off-topic speculative science unless tweet mentions it
+            txt_low = search_source["text"].lower()
+            sci_terms = ["multiverse", "quantum", "string theory", "higgs", "cosmology"]
+            if any(t in txt_low for t in sci_terms):
+                # Only allow if tweet explicitly contains the same term
+                tweet_low = (tweet_text or "").lower()
+                if not any(t in tweet_low for t in sci_terms):
+                    logger.info("Enrichment: skipping web search due to speculative-science drift")
+                    search_result = None
+                else:
+                    search_result = self._search_context(search_source["text"], base_context)
+            else:
+                search_result = self._search_context(search_source["text"], base_context)
             if search_result:
                 search_bullets, used_urls, query_used = search_result
                 logger.info("Enrichment: search query => {}", query_used)
@@ -325,9 +339,29 @@ class ContextEnricher:
         ]:
             if re.search(rf"\b{re.escape(org)}\b", clean, flags=re.I) and org not in terms:
                 terms.append(org)
-        # Proper noun sequences (simple heuristic)
+        # Proper noun sequences (simple heuristic) - but avoid common character names
+        common_character_names = {
+            "humpty dumpty", "little red riding hood", "goldilocks", "jack and jill",
+            "hansel and gretel", "snow white", "cinderella", "sleeping beauty",
+            "peter pan", "alice in wonderland", "winnie the pooh", "mickey mouse",
+            "donald duck", "goofy", "bugs bunny", "daffy duck", "tom and jerry"
+        }
+        
         for pn in re.findall(r"\b(?:[A-Z][a-z]+\s){1,3}[A-Z][a-z]+\b", raw):
             if pn not in terms and pn.lower() not in {t.lower() for t in terms}:
+                # Skip if it's a common character name and we're in a thread about that character
+                if base_context:
+                    root_post = base_context.get("root_post", "")
+                    # Handle both string and dict formats for root_post
+                    if isinstance(root_post, dict):
+                        root_post_text = root_post.get("text", "")
+                    else:
+                        root_post_text = str(root_post)
+                    
+                    if root_post_text.lower().find(pn.lower()) != -1:
+                        if pn.lower() in common_character_names:
+                            logger.info("Enrichment: skipping character name '{}' to avoid confusion", pn)
+                            continue
                 terms.append(pn)
         # Do not add author handle as a search term to avoid misattributing handles/domains as entities
 
@@ -341,18 +375,82 @@ class ContextEnricher:
         if topic:
             tweet_tokens = {w.lower() for w in re.findall(r"[a-zA-Z']+", clean)}
             topic_tokens = [w.lower() for w in re.findall(r"[a-zA-Z']+", topic)]
-            overlap = [w for w in topic_tokens if w in tweet_tokens]
-            if len(overlap) >= max(1, int(0.4 * len(set(topic_tokens)))):
+            # Remove stopwords for a content-based overlap
+            STOP = {
+                "the","a","an","and","or","but","of","to","for","in","on","with","by","as","at","from","that","this","these","those","is","are","be","was","were","it","its","it's","you","your","we","our","they","their"
+            }
+            topic_content = [w for w in topic_tokens if w not in STOP]
+            overlap = [w for w in topic_content if w in tweet_tokens]
+            # Require at least two content-word overlaps or >=40% content overlap (min 2)
+            enough_overlap = (len(overlap) >= 2) or (len(topic_content) > 0 and len(set(overlap)) >= max(2, int(0.4 * len(set(topic_content)))))
+            # Disallow speculative-science topics unless present in tweet tokens
+            SCI = {"multiverse","quantum","string","higgs","dark","cosmology","entropy"}
+            sci_in_topic = any(w in SCI for w in topic_content)
+            sci_in_tweet = any(w in tweet_tokens for w in SCI)
+            if enough_overlap and (not sci_in_topic or sci_in_tweet):
                 accepted_topic = topic
                 logger.info("Enrichment: accepted topic '{}' (overlap: {})", topic, ", ".join(overlap))
             else:
-                logger.info("Enrichment: discarded topic '{}' due to low overlap", topic)
+                logger.info("Enrichment: discarded topic '{}' due to low overlap or mismatch", topic)
 
-        base_part = accepted_topic or " ".join(clean.split()[:12])
+        # Prioritize thread context for base part if we're in a thread
+        base_part = accepted_topic
+        if not base_part and base_context:
+            # If we're in a thread, try to extract key terms from root post
+            root_post = base_context.get("root_post", "")
+            # Handle both string and dict formats for root_post
+            if isinstance(root_post, dict):
+                root_post_text = root_post.get("text", "")
+            else:
+                root_post_text = str(root_post)
+            
+            if root_post_text and len(root_post_text.strip()) > 20:
+                # Extract key terms from root post that might be more relevant
+                root_clean = re.sub(r"[^\w\s]", " ", root_post_text.lower())
+                root_terms = [w for w in root_clean.split() if len(w) > 3 and w not in {"that", "this", "with", "from", "they", "have", "been", "were", "said", "will", "would", "could", "should"}]
+                if root_terms:
+                    base_part = " ".join(root_terms[:8])
+                    logger.info("Enrichment: using root post terms for base: {}", base_part)
+        
+        # Fall back to tweet text if no better context found
+        if not base_part:
+            base_part = " ".join(clean.split()[:12])
         chosen_terms = (terms[:6] + hashtag_terms)[:8]
         if chosen_terms:
             logger.info("Enrichment: chosen terms => {}", ", ".join(chosen_terms))
         query = " ".join([base_part] + chosen_terms).strip()
         return (query[:160], chosen_terms)
+
+    def _get_search_context_source(self, base_context: Optional[Dict], tweet_text: str) -> Dict[str, str]:
+        """Determine the best source for search context - prioritize thread context over individual tweet."""
+        # Check if we have thread context that indicates the main topic
+        if base_context:
+            # Look for root post or thread context that gives us the main topic
+            root_post = base_context.get("root_post", "")
+            thread_depth = base_context.get("thread_depth", 0)
+            
+            # Handle both string and dict formats for root_post
+            if isinstance(root_post, dict):
+                root_post_text = root_post.get("text", "")
+            else:
+                root_post_text = str(root_post)
+            
+            # If we're in a thread (depth > 1) and have a root post, use that as primary context
+            if thread_depth > 1 and root_post_text and len(root_post_text.strip()) > 20:
+                # Combine root post with current tweet for better context
+                combined_context = f"{root_post_text} {tweet_text}".strip()
+                return {"source": "thread context", "text": combined_context}
+            
+            # Check for ancestor context that might be more informative
+            for i in range(1, 4):  # Check ancestor1, ancestor2, ancestor3
+                ancestor_key = f"ancestor{i}"
+                ancestor_text = base_context.get(ancestor_key, "")
+                if ancestor_text and len(ancestor_text.strip()) > 20:
+                    # Use ancestor if it seems more informative than current tweet
+                    if len(ancestor_text) > len(tweet_text) * 1.5:
+                        return {"source": f"ancestor{i} context", "text": ancestor_text}
+        
+        # Fall back to tweet text
+        return {"source": "tweet text", "text": tweet_text}
 
 

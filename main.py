@@ -7,23 +7,16 @@ from typing import Optional
 import argparse
 
 from loguru import logger
-from playwright.sync_api import sync_playwright
 
 from bot.config import AppConfig
 from bot.llm_client import LLMClient
 from bot.scheduler import IntervalScheduler, RateLimiter, run_loop
-from bot.twitter import TwitterBot
-from bot.x_api import XApiBot
 from bot.bsky import BskyBot
 from bot.context_enricher import ContextEnricher
 
 
-def choose_action(own_posting_probability: float) -> str:
-    return "own" if random.random() < own_posting_probability else "reply"
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Soupy Twitter Bot")
+    parser = argparse.ArgumentParser(description="Soupy Bluesky Bot")
     parser.add_argument("--now", action="store_true", help="Run one action immediately on start (respects hourly cap)")
     parser.add_argument("--reply", action="store_true", help="Force a reply action (overrides config/auto)")
     parser.add_argument("--post", action="store_true", help="Force a trending quote-retweet action at launch; if combined with --now, do post first then reply")
@@ -33,7 +26,7 @@ def main() -> None:
     config.validate()
 
     logger.add("soupy.log", rotation="1 MB", retention=5)
-    logger.info("Starting Soupy Twitter Bot")
+    logger.info("Starting Soupy Bluesky Bot")
 
     llm = LLMClient(config)
     rate_limiter = RateLimiter(config.actions_per_hour_cap)
@@ -98,7 +91,14 @@ def main() -> None:
                             "ft.com","theguardian.com","npr.org","axios.com","politico.com","aljazeera.com","cnn.com","cbsnews.com",
                             "abcnews.go.com","nbcnews.com","pbs.org","latimes.com","economist.com"
                         }
-                        AVOID = {"stackoverflow.com","github.com","stackexchange.com","reddit.com","medium.com","quora.com"}
+                        AVOID = {
+                            "stackoverflow.com","github.com","stackexchange.com","medium.com","quora.com",
+                            "forums.redflagdeals.com","dealnews.com","slickdeals.net","retailmenot.com",
+                            "amazon.com","ebay.com","walmart.com","target.com","bestbuy.com",
+                            "tripadvisor.com","yelp.com","zillow.com","realtor.com",
+                            "indeed.com","linkedin.com","glassdoor.com","monster.com",
+                            "webmd.com","healthline.com","mayoclinic.org","medlineplus.gov"
+                        }
                         # Use LLM to analyze the seed post and determine the best topic and search queries
                         logger.info("Daily post: analyzing seed post with LLM to determine topic and search queries")
                         
@@ -109,26 +109,44 @@ def main() -> None:
                         
                         # Use LLM to determine the main topic and generate search queries
                         topic_analysis = llm.analyze_topic_and_generate_queries(analysis_context)
+                        logger.debug("Daily post: LLM topic analysis response: {}", topic_analysis[:500])
                         
                         # Parse the LLM response to extract topic and queries
                         lines = topic_analysis.strip().split('\n')
                         topic = "politics news"  # Default fallback
                         
-                        # Extract topic from first line
+                        # Extract topic from first line (more robust parsing)
                         for line in lines:
-                            if line.strip().startswith('TOPIC:'):
-                                topic = line.strip().replace('TOPIC:', '').strip()
+                            line = line.strip()
+                            if line.startswith('TOPIC:'):
+                                topic = line.replace('TOPIC:', '').strip()
+                                break
+                            elif line.startswith('Topic:'):
+                                topic = line.replace('Topic:', '').strip()
                                 break
                         
-                        # Extract search queries from the analysis
+                        # Extract search queries from the analysis (more robust)
                         queries = []
                         for line in lines:
                             line = line.strip()
-                            if line and not line.startswith('TOPIC:') and not line.startswith('#'):
-                                # Clean up the query
-                                query = line.lstrip('- ').strip()
-                                if query and len(query) > 3:
+                            if line and not line.startswith('TOPIC:') and not line.startswith('Topic:') and not line.startswith('#'):
+                                # Clean up the query - handle various formats
+                                query = line.lstrip('- •*').strip()
+                                # Remove any trailing punctuation that might confuse search
+                                query = query.rstrip('.,;:')
+                                if query and len(query) > 3 and query.lower() not in ['topic', 'queries', 'search queries']:
                                     queries.append(query)
+                        
+                        # Additional validation: ensure queries are reasonable
+                        validated_queries = []
+                        for query in queries:
+                            # Skip if it's too generic or too specific
+                            if (len(query.split()) >= 2 and 
+                                len(query) <= 100 and 
+                                not query.lower().startswith(('the ', 'a ', 'an '))):
+                                validated_queries.append(query)
+                        
+                        queries = validated_queries
                         
                         # Fallback if LLM didn't generate enough queries
                         if len(queries) < 3:
@@ -139,7 +157,7 @@ def main() -> None:
                                     queries.append(fq)
                         
                         logger.info("Daily post: LLM determined topic: '{}'", topic)
-                        logger.info("Daily post: LLM generated {} search queries", len(queries))
+                        logger.info("Daily post: LLM generated {} search queries: {}", len(queries), queries[:3])
                         
                         # Prepend ddgs top headlines as extra queries if the current queries are weak
                         if len(queries) < 3:
@@ -226,6 +244,18 @@ def main() -> None:
                                     if any(word in text.lower() for word in quality_words):
                                         score += 2.0
                                     
+                                    # Factor 6: Topic relevance check
+                                    topic_relevance = _check_topic_relevance(text, title, q)
+                                    if topic_relevance < 0.3:  # Low relevance threshold
+                                        score -= 10.0  # Heavy penalty for irrelevant content
+                                        logger.warning("Daily post: low topic relevance ({:.2f}) for '{}'", topic_relevance, title[:50])
+                                    
+                                    # Factor 7: Avoid retail/commercial content
+                                    commercial_indicators = ['price', 'buy', 'sale', 'discount', 'deal', 'shop', 'store', 'retail', 'tire', 'inventory']
+                                    if any(indicator in text.lower() for indicator in commercial_indicators):
+                                        score -= 5.0
+                                        logger.warning("Daily post: commercial content detected in '{}'", title[:50])
+                                    
                                     article_scores.append((score, idx, item, content_len))
                             
                             if article_scores:
@@ -239,6 +269,24 @@ def main() -> None:
                                           topic, url, best_score, best_len)
                                 return (topic, url, snippets)
                         return ("news", "", [])
+
+                    def _check_topic_relevance(text: str, title: str, query: str) -> float:
+                        """Check how relevant the content is to the search query."""
+                        # Extract key terms from query
+                        query_terms = [word.lower() for word in query.split() if len(word) > 3]
+                        
+                        # Combine text and title for analysis
+                        combined_text = f"{title} {text}".lower()
+                        
+                        # Count how many query terms appear in the content
+                        matches = sum(1 for term in query_terms if term in combined_text)
+                        
+                        # Calculate relevance score (0.0 to 1.0)
+                        if not query_terms:
+                            return 0.5  # Default if no query terms
+                        
+                        relevance = matches / len(query_terms)
+                        return min(relevance, 1.0)
 
                     topic, url, snippets = _asyncio.run(_search_pick())
                 finally:
@@ -435,10 +483,8 @@ def main() -> None:
         finally:
             bot.stop()
         return
-    elif config.use_x_api:
-        bot = XApiBot(config, llm)
-        bot.start()
-        enricher = ContextEnricher(config, llm)
+    elif False:
+        bot = None  # X API removed
 
         # Run API-mode loop (original posts only)
         try:
@@ -482,10 +528,8 @@ def main() -> None:
             bot.stop()
         return
     else:
-        with sync_playwright() as p:
-            bot = TwitterBot(config, p)
-            bot.start()
-            enricher = ContextEnricher(config, llm)
+        # Browser-based Twitter automation removed; Bluesky only
+        enricher = ContextEnricher(config, llm)
         
 
         # Trending schedule state (2/day, 4–8h apart)

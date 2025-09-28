@@ -86,12 +86,13 @@ class LLMClient:
         """
         system = (
             f"{self._config.behaviour_prompt}\n"
-            "You are posting a Bluesky reply. Be sharp yet constructive; add genuine insight.\n"
-            "Constraints: Prefer <= 360 characters. No surrounding quotes. Do not mention @handles.\n"
+            "You are posting a Bluesky reply. Be concise and decisive; if the post is opinionated/critical, reply with a crisp, pointed line.\n"
+            "Constraints: Prefer one short sentence (two max). No surrounding quotes. No @handles. Avoid hedging (no 'maybe', 'might', 'seems', 'perhaps').\n"
             "Avoid restating the original link if the post already includes one.\n"
             "Stay strictly grounded in the post and provided context; do not introduce unrelated references.\n"
-            "Assume good faith unless the post itself contains explicit harm/accusation. Prefer additive, supportive, or curious phrasing over prescriptive critique.\n"
-            "Style: crisp, coherent sentences (sentence case), engaging but not hostile; witty is fine, ad hominem is not.\n"
+            "CRITICAL: Read the context carefully. Distinguish between who is speaking vs who is being discussed. "
+            "If context mentions multiple people, understand their roles (interviewer vs subject, narrator vs protagonist).\n"
+            "Style: crisp, coherent sentences; engaging but not hostile. Witty is fine; avoid ad hominem.\n"
             "If 'sources:' contains a truly useful URL, include at most one plain URL at the end."
         )
         user_parts = [
@@ -104,7 +105,9 @@ class LLMClient:
                 + conversation_context
                 + "\nGuidance: Align with 'root_post', 'ancestors', or 'thread_vibe' if present."
                 + " If 'url_summary:' is present, rely on it and avoid adding unrelated web-search claims."
-                + " If the post is informational/celebratory or the tone is neutral/encouraging, keep the reply neutral/appreciative; avoid criticizing the poster or outlet."
+                + " Match tone: if it's critical, be concise and pointed; if it's light, keep it light."
+                + " CRITICAL: Before replying, identify WHO is the main subject of the story vs WHO is the narrator/interviewer. "
+                + "Don't confuse the person telling the story with the person the story is about."
                 + " Offer one concrete insight (why it matters, implication, or trade-off) using post or url summary details."
                 + " Only refer to entities present in the post or context. If uncertain, ask a concise, relevant question."
             )
@@ -202,6 +205,12 @@ class LLMClient:
                 score += 1
             else:
                 score -= 2
+            # Penalize ideological/meta framings that drift from the post (e.g., 'the system', 'wealthy interests', 'corporate elites')
+            if any(phrase in lc for phrase in [
+                "the system", "wealthy interests", "corporate elite", "corporate elites", "the elites", "culture war",
+                "mainstream media", "agenda", "propaganda"
+            ]):
+                score -= 2
             # Reward question or concrete angle (but avoid confrontational framing words)
             if "?" in c:
                 score += 2
@@ -216,9 +225,17 @@ class LLMClient:
             # Bonus if it uses a number seen in context (e.g., 81.7, 0.8)
             if any(num in c for num in context_numbers):
                 score += 1
-            # Slight reward for brevity within 200-360
-            if 120 <= len(c) <= 360:
-                score += 1
+            # Prefer brevity and decisiveness
+            # Penalize hedging phrases
+            if any(h in lc for h in ["maybe", "might", "seems", "perhaps", "could be", "i think", "i feel"]):
+                score -= 2
+            # Prefer brevity: reward 80-220 the most; above max gets penalized
+            if 80 <= len(c) <= 220:
+                score += 2
+            elif 221 <= len(c) <= 360:
+                score += 0
+            if len(c) > max(200, int(self._config.bsky_reply_max_chars)):
+                score -= 3
             # If ambiguity (low overlap) add bonus for very short replies to prefer concise acknowledgments
             if len(cand_tokens & basis_tokens) < 3:
                 if len(c) <= 80:
@@ -296,16 +313,18 @@ class LLMClient:
         """
         system = (
             f"{self._config.behaviour_prompt}\n"
-            "You refine Bluesky replies for clarity and a human tone. Keep the edge, avoid hostility.\n"
-            "Constraints: Prefer <= 360 characters. No @handles. No surrounding quotes.\n"
+            "You refine Bluesky replies for clarity, tone-match, and brevity. Keep it friendly; avoid hostility.\n"
+            "Constraints: 1–2 short sentences, stay under the configured max (default 300–360). No @handles, no quotes.\n"
             "Grounding: Do not introduce new facts; stay within the post and provided context.\n"
+            "CRITICAL: Ensure you understand who is the subject of the story vs who is telling it. "
+            "Don't confuse the narrator/interviewer with the main subject being discussed.\n"
             "Avoid artifacts like using '.com' as a person's name unless it is a URL; prefer the person's name or 'the senator'."
         )
         user_parts = [
             "Post:", post_text,
             "Context:", conversation_context or "-",
             "Draft:", draft_reply,
-            "Refine the Draft (1-2 sentences, crisp, coherent, grounded):",
+            "Refine the Draft (keep tone, 1 short sentence preferred; 2 max):",
         ]
         user = "\n".join(user_parts)
         response = self._client.chat.completions.create(
@@ -380,11 +399,14 @@ class LLMClient:
         """
         system = (
             f"{self._config.behaviour_prompt}\n"
-            "You analyze tweets to extract key points. Keep it grounded strictly in the tweet text."
+            "You analyze tweets to extract key points. Keep it grounded strictly in the tweet text.\n"
+            "CRITICAL: Distinguish between who is speaking/acting vs who is being discussed. "
+            "If a post mentions multiple people, clearly identify the subject vs the narrator/interviewer."
         )
         user = (
             "Analyze the tweet. List 2-4 concise bullets that capture:\n"
-            "- main claim(s) or point(s)\n- named entities (people/orgs)\n- tone/stance if evident.\n"
+            "- main claim(s) or point(s)\n- named entities (people/orgs) and their roles\n- tone/stance if evident\n"
+            "- WHO is the subject being discussed vs WHO is doing the discussing\n"
             f"Tweet: {tweet_text}\n"
             f"Keep under {max_chars} characters total.\n"
             "Bullets:"
@@ -443,7 +465,7 @@ class LLMClient:
         retry=retry_if_exception_type(Exception),
     )
     def generate_own_post(self, topic_hint: Optional[str] = None) -> str:
-        """Generate an original post for X (Twitter)."""
+        """Generate an original post (generic)."""
         system = (
             f"{self._config.behaviour_prompt}\n"
             "Compose a natural, human-sounding X post.\n"
@@ -478,11 +500,14 @@ class LLMClient:
         """
         system = (
             f"{self._config.behaviour_prompt}\n"
-            "You concisely summarize web pages for context used in replies."
+            "You concisely summarize web pages for context used in replies.\n"
+            "CRITICAL: When summarizing, clearly distinguish between who is speaking/interviewing vs who is being discussed. "
+            "Identify the main subject of the story vs the narrator or interviewer."
         )
         user = (
             "Summarize the following page to help craft a relevant tweet reply. "
             "Use 2-5 short bullets with the most important facts. Avoid fluff.\n"
+            "IMPORTANT: Identify WHO is the main subject of the story vs WHO is telling the story.\n"
             f"Title: {title}\n"
             f"Content: {text[: max(0, max_chars * 3)]}\n"
             f"Keep under {max_chars} characters total.\n"
@@ -612,11 +637,13 @@ class LLMClient:
             f"Topic: {topic}",
             "Use 1-2 sentences to summarize what's important and timely,",
             "then add one crisp opinion (no hashtags unless essential).",
-            "Stance: subtly left-leaning and pro-worker where relevant (avoid slogans; keep it natural).",
-            "If not obviously political, prefer a governance, labor, or inequality angle where appropriate.",
+            "Stance: subtly critique power structures, wealth inequality, and corporate influence when relevant.",
+            "Be skeptical of authority and capitalism's excesses. Support workers and question the system.",
+            "If not obviously political, find the governance, labor, or inequality angle.",
+            "Avoid explicit labels like 'socialist' or 'marxist' - just show the perspective naturally.",
             "Format: Commentary first, then a space and the URL as the final token.",
             "Do not include any usernames or quotes. No hashtags unless essential.",
-            "IMPORTANT: Do not start with prefixes like 'BREAKING:', 'UPDATE:', 'NEWS:', or any other news-style prefixes. Write naturally as a regular post.",
+            "CRITICAL: Never start with prefixes like 'important:', 'BREAKING:', 'UPDATE:', 'NEWS:', 'ALERT:', 'URGENT:', 'LATEST:', 'DEVELOPING:', 'JUST IN:', 'EXCLUSIVE:', or any other news-style prefixes. Write naturally as a regular post without any introductory labels.",
             f"Snippets (for grounding):\n- {joined_snips}" if joined_snips else "",
             f"Include exactly this URL at the end: {url}",
             f"Keep under {max_chars} characters total.",
@@ -639,6 +666,9 @@ class LLMClient:
         content = re.sub(r"@[A-Za-z0-9_\.\-]+", "", content)
         # Remove any existing URLs from content (more comprehensive regex)
         content = re.sub(r"https?://[^\s]+", "", content).strip()
+        # Remove prefixes like "important:", "BREAKING:", "UPDATE:", etc. (only at the very beginning)
+        content = re.sub(r"^(important|breaking|update|news|alert|urgent|latest|developing|just in|exclusive):\s*", "", content, flags=re.IGNORECASE)
+        content = content.strip()
         # Shorten URL first to know its actual length
         short_url = shorten_url_tinyurl(url)
         logger.debug("LLM: original URL: {} -> shortened: {}", url, short_url)

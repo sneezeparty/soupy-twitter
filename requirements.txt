@@ -7,7 +7,9 @@ requests==2.32.3
 httpx<0.28
 beautifulsoup4==4.12.3
 lxml==5.3.0
-tweepy==4.14.0
 atproto==0.0.56
 ddgs==2.3.0
+
+# For grapheme-aware truncation
+regex==2024.9.11
 

@@ -505,53 +505,173 @@ class BskyBot:
             url = urls[0]
             logger.debug("Bsky: creating external embed for URL: {}", url)
             
-            # Fetch URL metadata
-            title, description = self._fetch_url_metadata(url)
+            # Fetch URL metadata with improved error handling
+            try:
+                title, description, image_url = self._fetch_url_metadata(url)
+            except Exception as exc:
+                logger.warning("Bsky: metadata fetch failed for {}, using fallback: {}", url, exc)
+                # Use fallback metadata
+                try:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(url)
+                    domain = parsed.netloc or url
+                    title = f"Link from {domain}"
+                    description = ""
+                    image_url = None
+                except Exception:
+                    title = "Link"
+                    description = ""
+                    image_url = None
+            
+            # Create the external embed object
+            external_data = {
+                "uri": url,
+                "title": title or "Link",
+                "description": description or ""
+            }
+            
+            # Add image thumbnail if available
+            if image_url:
+                try:
+                    thumb_blob = self._upload_image_blob(image_url)
+                    if thumb_blob:
+                        external_data["thumb"] = thumb_blob
+                        logger.info("Bsky: added image thumbnail to external embed for {}", url)
+                    else:
+                        logger.warning("Bsky: failed to upload image blob for {}", image_url)
+                except Exception as exc:
+                    logger.warning("Bsky: failed to add image thumbnail: {}", exc)
             
             # Create external embed
             external_embed = bsky_models.AppBskyEmbedExternal.Main(
-                external=bsky_models.AppBskyEmbedExternal.External(
-                    uri=url,
-                    title=title or "Link",
-                    description=description or ""
-                )
+                external=bsky_models.AppBskyEmbedExternal.External(**external_data)
             )
             
-            logger.debug("Bsky: created external embed with title: '{}'", title)
+            logger.info("Bsky: created external embed with title: '{}' (has_thumb: {})", 
+                       title, "thumb" in external_data)
             return external_embed
             
         except Exception as exc:
             logger.warning("Bsky: failed to create external embed: {}", exc)
             return None
 
-    def _fetch_url_metadata(self, url: str) -> tuple[Optional[str], Optional[str]]:
-        """Fetch title and description from a URL for embed metadata."""
+    def _fetch_url_metadata(self, url: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """Fetch Open Graph metadata from a URL for embed metadata.
+        
+        Returns (title, description, image_url)
+        """
         try:
-            from .utils import fetch_and_extract_readable_text
-            title, text = fetch_and_extract_readable_text(url, timeout=8)
+            import requests
+            from bs4 import BeautifulSoup
+            from urllib.parse import urljoin, urlparse
+            
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            }
+            
+            # Fetch the HTML
+            resp = requests.get(url, headers=headers, timeout=8, allow_redirects=True)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            
+            # Parse Open Graph meta tags
+            title = None
+            description = None
+            image_url = None
+            
+            # Try Open Graph tags first
+            og_title = soup.find("meta", property="og:title")
+            if og_title and og_title.get("content"):
+                title = og_title["content"].strip()
+            
+            og_description = soup.find("meta", property="og:description")
+            if og_description and og_description.get("content"):
+                description = og_description["content"].strip()
+            
+            og_image = soup.find("meta", property="og:image")
+            if og_image and og_image.get("content"):
+                image_url = og_image["content"].strip()
+                # Convert relative URLs to absolute
+                if not image_url.startswith(('http://', 'https://')):
+                    image_url = urljoin(url, image_url)
+            
+            # Fallback to standard meta tags if Open Graph not available
+            if not title:
+                title_tag = soup.find("title")
+                if title_tag and title_tag.string:
+                    title = title_tag.string.strip()
+            
+            if not description:
+                desc_tag = soup.find("meta", attrs={"name": "description"})
+                if desc_tag and desc_tag.get("content"):
+                    description = desc_tag["content"].strip()
             
             # Clean up the title
             if title and len(title) > 100:
                 title = title[:97] + "..."
             
-            # Extract a description from the text
-            description = None
-            if text:
-                # Take first paragraph or first 200 chars
-                lines = text.split('\n')
-                for line in lines:
-                    line = line.strip()
-                    if len(line) > 50:  # Skip very short lines
-                        description = line[:200]
-                        if len(line) > 200:
-                            description += "..."
-                        break
+            # Clean up the description
+            if description and len(description) > 200:
+                description = description[:197] + "..."
             
-            return title, description
+            logger.debug("Bsky: fetched metadata for {}: title='{}', description='{}', image='{}'", 
+                        url, title, description, image_url)
+            
+            return title, description, image_url
             
         except Exception as exc:
+            # Log the error but don't let it crash the posting process
             logger.warning("Bsky: failed to fetch URL metadata for {}: {}", url, exc)
-            return None, None
+            # Return a fallback title based on the URL
+            try:
+                from urllib.parse import urlparse
+                parsed = urlparse(url)
+                domain = parsed.netloc or url
+                fallback_title = f"Link from {domain}"
+                return fallback_title, None, None
+            except Exception:
+                return "Link", None, None
+
+    def _upload_image_blob(self, image_url: str) -> Optional[Any]:
+        """Upload an image from URL as a blob for embedding.
+        
+        Returns a blob object or None if upload fails.
+        """
+        try:
+            import requests
+            
+            # Fetch the image
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            }
+            
+            resp = requests.get(image_url, headers=headers, timeout=10)
+            resp.raise_for_status()
+            
+            # Check content type
+            content_type = resp.headers.get('content-type', '').lower()
+            if not content_type.startswith('image/'):
+                logger.warning("Bsky: URL does not appear to be an image: {}", image_url)
+                return None
+            
+            # Check file size (limit to 1MB as per BlueSky docs)
+            if len(resp.content) > 1000000:
+                logger.warning("Bsky: image too large ({} bytes), skipping", len(resp.content))
+                return None
+            
+            # Upload as blob using the correct API call from BlueSky docs
+            blob_resp = self._client.com.atproto.repo.upload_blob(
+                data=resp.content
+            )
+            
+            logger.debug("Bsky: uploaded image blob for {} (size: {} bytes)", image_url, len(resp.content))
+            return blob_resp.blob
+            
+        except Exception as exc:
+            logger.warning("Bsky: failed to upload image blob for {}: {}", image_url, exc)
+            return None
 
     # Posting
     def create_post(self, text: str) -> bool:
@@ -563,14 +683,25 @@ class BskyBot:
             # Check if the post contains a URL and create external embed
             embed = self._create_external_embed(safe_text)
             
+            # Create URL facets to make URLs clickable in the text
+            facets = self._create_url_facets(safe_text)
+            
             if embed:
                 # Use external embed for rich link preview
-                self._client.send_post(text=safe_text, embed=embed)
-                logger.info("Bsky: posted with external embed ({} chars)", len(text))
+                if facets:
+                    self._client.send_post(text=safe_text, embed=embed, facets=facets)
+                    logger.info("Bsky: posted with external embed and URL facets ({} chars)", len(text))
+                else:
+                    self._client.send_post(text=safe_text, embed=embed)
+                    logger.info("Bsky: posted with external embed ({} chars)", len(text))
             else:
                 # Regular post without URLs
-                self._client.send_post(text=safe_text)
-                logger.info("Bsky: posted ({} chars)", len(text))
+                if facets:
+                    self._client.send_post(text=safe_text, facets=facets)
+                    logger.info("Bsky: posted with URL facets ({} chars)", len(text))
+                else:
+                    self._client.send_post(text=safe_text)
+                    logger.info("Bsky: posted ({} chars)", len(text))
             return True
         except Exception as exc:
             logger.error("Bsky: failed to post: {}", exc)
@@ -615,6 +746,10 @@ class BskyBot:
                     # Skip if we've already replied to this post
                     already_replied_this = bool(uri and uri in self._replied_uris)
                     if not uri or not cid:
+                        continue
+                    # Skip sports-related posts
+                    if self._is_sports_text(text):
+                        logger.info("Bsky: skipping sports post uri={}", uri)
                         continue
                     # Skip recently replied-to authors (cooldown)
                     recent_author = bool(author and author in self._recent_authors)
@@ -677,6 +812,7 @@ class BskyBot:
                         ctx.update({
                             "root_post": thread_ctx["root_post"],
                             "thread_depth": thread_ctx.get("thread_depth", 1),
+                            "root_child_replies": thread_ctx.get("root_child_replies", []),
                         })
                     try:
                         quoted = self._extract_quoted_from_post_view(post)
@@ -714,7 +850,26 @@ class BskyBot:
                 logger.warning("Bsky: no suitable post found in timeline; trying relaxed selection")
                 if not relaxed_candidates:
                     return None
-                pick_from = relaxed_candidates[: min(self._candidate_pool_size, len(relaxed_candidates))]
+                # Prefer relaxed candidates that we have not replied to (by uri or root) and whose author isn't in recent cooldown
+                try:
+                    filtered_relaxed: List[Dict[str, Any]] = []
+                    for it in relaxed_candidates:
+                        u = it.get("uri")
+                        ru = it.get("root_uri")
+                        a = (it.get("author") or "").strip()
+                        if (u and u in self._replied_uris) or (ru and ru in self._replied_uris):
+                            continue
+                        if a and a in self._recent_authors:
+                            continue
+                        filtered_relaxed.append(it)
+                    pool = filtered_relaxed if filtered_relaxed else relaxed_candidates
+                    # Shuffle to add variability across runs before trimming the pool
+                    import random as _rand
+                    pool = pool.copy()
+                    _rand.shuffle(pool)
+                    pick_from = pool[: min(self._candidate_pool_size, len(pool))]
+                except Exception:
+                    pick_from = relaxed_candidates[: min(self._candidate_pool_size, len(relaxed_candidates))]
             else:
                 # Randomize among first N candidates to diversify
                 pick_from = candidates[: min(self._candidate_pool_size, len(candidates))]
@@ -747,20 +902,71 @@ class BskyBot:
                         break
                 logger.info("Bsky: recency-weighted pick among followed authors (half-life {}h)", half_life_hours)
             else:
-                chosen = random.choice(pick_from)
+                # Shuffle before random choice to add cross-run variability
+                try:
+                    import random as _rand
+                    pool = pick_from.copy()
+                    _rand.shuffle(pool)
+                    chosen = random.choice(pool)
+                except Exception:
+                    chosen = random.choice(pick_from)
             uri = chosen["uri"]
             cid = chosen["cid"]
             author = chosen.get("author")
             root_uri = chosen.get("root_uri")
             ctx = chosen["ctx"]
             self._current_post_context = ctx
+            # Build reply_ref with 70/30 targeting (root vs first-level reply)
+            reply_ref = None
+            try:
+                r = random.random()
+                root_info = (ctx or {}).get("root_post") or {}
+                root_uri_eff = root_uri or root_info.get("uri")
+                root_cid = root_info.get("cid")
+                if root_uri_eff and root_cid:
+                    if r < 0.7:
+                        # Reply to the root post (top-level)
+                        reply_ref = bsky_models.AppBskyFeedPost.ReplyRef(
+                            root=bsky_models.ComAtprotoRepoStrongRef.Main(uri=root_uri_eff, cid=root_cid),
+                            parent=bsky_models.ComAtprotoRepoStrongRef.Main(uri=root_uri_eff, cid=root_cid),
+                        )
+                        logger.info("Bsky: targeting root post for reply (70%) uri={}", root_uri_eff)
+                    else:
+                        # Reply to a first-level reply to the root
+                        first_level = (ctx or {}).get("root_child_replies") or []
+                        my_handle_plain = (self._config.bsky_handle or "").lstrip("@").lower()
+                        filtered = []
+                        for it in first_level:
+                            a = (it.get("author") or "").lstrip("@").lower()
+                            if a and my_handle_plain and a == my_handle_plain:
+                                continue
+                            if it.get("uri") and it.get("cid"):
+                                filtered.append(it)
+                        target = random.choice(filtered) if filtered else None
+                        if target:
+                            t_uri = target.get("uri")
+                            t_cid = target.get("cid")
+                            reply_ref = bsky_models.AppBskyFeedPost.ReplyRef(
+                                root=bsky_models.ComAtprotoRepoStrongRef.Main(uri=root_uri_eff, cid=root_cid),
+                                parent=bsky_models.ComAtprotoRepoStrongRef.Main(uri=t_uri, cid=t_cid),
+                            )
+                            logger.info("Bsky: targeting first-level reply for reply (30%) parent_uri={} root_uri={}", t_uri, root_uri_eff)
+                        else:
+                            reply_ref = bsky_models.AppBskyFeedPost.ReplyRef(
+                                root=bsky_models.ComAtprotoRepoStrongRef.Main(uri=root_uri_eff, cid=root_cid),
+                                parent=bsky_models.ComAtprotoRepoStrongRef.Main(uri=root_uri_eff, cid=root_cid),
+                            )
+                            logger.info("Bsky: no first-level replies found; falling back to root")
+            except Exception:
+                reply_ref = None
+
             self._reply_target = {
                 "uri": uri,
                 "cid": cid,
                 "root_uri": root_uri,
                 "author_handle": author,
                 "author_did": chosen.get("author_did"),
-                "reply_ref": bsky_models.AppBskyFeedPost.ReplyRef(
+                "reply_ref": reply_ref or bsky_models.AppBskyFeedPost.ReplyRef(
                     root=bsky_models.ComAtprotoRepoStrongRef.Main(uri=uri, cid=cid),
                     parent=bsky_models.ComAtprotoRepoStrongRef.Main(uri=uri, cid=cid),
                 ),
@@ -916,6 +1122,7 @@ class BskyBot:
                         ctx.update({
                             "root_post": thread_ctx["root_post"],
                             "thread_depth": thread_ctx.get("thread_depth", 1),
+                            "root_child_replies": thread_ctx.get("root_child_replies", []),
                         })
                     candidates.append({
                         "uri": uri,
@@ -930,7 +1137,14 @@ class BskyBot:
             if not candidates:
                 logger.warning("Bsky: no suitable post found in discover")
                 return None
-            pick_from = candidates[: min(self._candidate_pool_size, len(candidates))]
+            # Shuffle candidate pool for variability before trimming
+            try:
+                import random as _rand
+                pool = candidates.copy()
+                _rand.shuffle(pool)
+                pick_from = pool[: min(self._candidate_pool_size, len(pool))]
+            except Exception:
+                pick_from = candidates[: min(self._candidate_pool_size, len(candidates))]
             chosen = random.choice(pick_from)
             uri = chosen["uri"]
             cid = chosen["cid"]
@@ -938,13 +1152,55 @@ class BskyBot:
             root_uri = chosen.get("root_uri")
             ctx = chosen["ctx"]
             self._current_post_context = ctx
+            # Build reply_ref with 70/30 targeting (root vs first-level reply)
+            reply_ref = None
+            try:
+                r = random.random()
+                root_info = (ctx or {}).get("root_post") or {}
+                root_uri_eff = root_uri or root_info.get("uri")
+                root_cid = root_info.get("cid")
+                if root_uri_eff and root_cid:
+                    if r < 0.7:
+                        reply_ref = bsky_models.AppBskyFeedPost.ReplyRef(
+                            root=bsky_models.ComAtprotoRepoStrongRef.Main(uri=root_uri_eff, cid=root_cid),
+                            parent=bsky_models.ComAtprotoRepoStrongRef.Main(uri=root_uri_eff, cid=root_cid),
+                        )
+                        logger.info("Bsky: targeting root post for reply (70%) uri={}", root_uri_eff)
+                    else:
+                        first_level = (ctx or {}).get("root_child_replies") or []
+                        my_handle_plain = (self._config.bsky_handle or "").lstrip("@").lower()
+                        filtered = []
+                        for it in first_level:
+                            a = (it.get("author") or "").lstrip("@").lower()
+                            if a and my_handle_plain and a == my_handle_plain:
+                                continue
+                            if it.get("uri") and it.get("cid"):
+                                filtered.append(it)
+                        target = random.choice(filtered) if filtered else None
+                        if target:
+                            t_uri = target.get("uri")
+                            t_cid = target.get("cid")
+                            reply_ref = bsky_models.AppBskyFeedPost.ReplyRef(
+                                root=bsky_models.ComAtprotoRepoStrongRef.Main(uri=root_uri_eff, cid=root_cid),
+                                parent=bsky_models.ComAtprotoRepoStrongRef.Main(uri=t_uri, cid=t_cid),
+                            )
+                            logger.info("Bsky: targeting first-level reply for reply (30%) parent_uri={} root_uri={}", t_uri, root_uri_eff)
+                        else:
+                            reply_ref = bsky_models.AppBskyFeedPost.ReplyRef(
+                                root=bsky_models.ComAtprotoRepoStrongRef.Main(uri=root_uri_eff, cid=root_cid),
+                                parent=bsky_models.ComAtprotoRepoStrongRef.Main(uri=root_uri_eff, cid=root_cid),
+                            )
+                            logger.info("Bsky: no first-level replies found; falling back to root")
+            except Exception:
+                reply_ref = None
+
             self._reply_target = {
                 "uri": uri,
                 "cid": cid,
                 "root_uri": root_uri,
                 "author_handle": author,
                 "author_did": chosen.get("author_did"),
-                "reply_ref": bsky_models.AppBskyFeedPost.ReplyRef(
+                "reply_ref": reply_ref or bsky_models.AppBskyFeedPost.ReplyRef(
                     root=bsky_models.ComAtprotoRepoStrongRef.Main(uri=uri, cid=cid),
                     parent=bsky_models.ComAtprotoRepoStrongRef.Main(uri=uri, cid=cid),
                 ),
@@ -997,6 +1253,7 @@ class BskyBot:
             root_text = getattr(root_record, 'text', '') if root_record else ''
             root_author = getattr(getattr(root_post_like, 'author', None), 'handle', None)
             root_uri = getattr(root_post_like, 'uri', None)
+            root_cid = getattr(root_post_like, 'cid', None)
             
             # Count thread depth
             thread_depth = self._count_thread_depth(thread)
@@ -1005,18 +1262,25 @@ class BskyBot:
             ancestors = self._collect_ancestors(thread, limit=3)
             sibling_replies = self._collect_sibling_replies(thread, limit=4)
             child_replies = self._collect_child_replies(thread, limit=2)
+            # Also collect first-level replies to the root post (for targeting policy)
+            try:
+                root_child_replies = self._collect_child_replies(root_post, limit=10)
+            except Exception:
+                root_child_replies = []
 
             context = {
                 'root_post': {
                     'text': root_text,
                     'author': f"@{root_author}" if root_author else None,
                     'uri': root_uri,
+                    'cid': root_cid,
                 },
                 'current_post': self._current_post_context,
                 'thread_depth': thread_depth,
                 'ancestors': ancestors,
                 'sibling_replies': sibling_replies,
                 'child_replies': child_replies,
+                'root_child_replies': root_child_replies,
             }
             
             # Verbose summary (compact)
@@ -1286,14 +1550,25 @@ class BskyBot:
             # Check if the reply contains URLs and create external embed
             embed = self._create_external_embed(text)
             
+            # Create URL facets to make URLs clickable in the text
+            facets = self._create_url_facets(text)
+            
             if embed:
                 # Use external embed for rich link preview in replies
-                self._client.send_post(text=text, reply_to=reply_ref, embed=embed)
-                logger.info("Bsky: replied with external embed ({} chars)", len(text))
+                if facets:
+                    self._client.send_post(text=text, reply_to=reply_ref, embed=embed, facets=facets)
+                    logger.info("Bsky: replied with external embed and URL facets ({} chars)", len(text))
+                else:
+                    self._client.send_post(text=text, reply_to=reply_ref, embed=embed)
+                    logger.info("Bsky: replied with external embed ({} chars)", len(text))
             else:
                 # Regular reply without URLs
-                self._client.send_post(text=text, reply_to=reply_ref)
-                logger.info("Bsky: replied ({} chars)", len(text))
+                if facets:
+                    self._client.send_post(text=text, reply_to=reply_ref, facets=facets)
+                    logger.info("Bsky: replied with URL facets ({} chars)", len(text))
+                else:
+                    self._client.send_post(text=text, reply_to=reply_ref)
+                    logger.info("Bsky: replied ({} chars)", len(text))
             try:
                 # Record current post URI and root URI to avoid thread repeats
                 self._record_replied(self._reply_target.get("uri"))
@@ -1400,5 +1675,28 @@ class BskyBot:
             return url
         except Exception:
             return None
+
+    def _is_sports_text(self, text: str) -> bool:
+        """Check if text is sports-related."""
+        t = text.lower()
+        sports_terms = [
+            # leagues
+            "nfl","nba","mlb","nhl","ncaa","premier league","la liga","serie a","bundesliga","uefa","fifa",
+            # events
+            "super bowl","world series","stanley cup","finals","playoffs","draft","combine","opening day",
+            # teams/positions/common words
+            "sixers","76ers","embiid","joel embiid","iverson","maxey","edgecombe","mccain",
+            "yankees","mets","dodgers","giants","cardinals","braves","astros","phillies","padres","cubs","red sox",
+            "lakers","clippers","warriors","kings","suns","spurs","rockets","mavericks","mavs","nuggets","jazz","thunder","grizzlies","trail blazers","blazers","pelicans","hornets","hawks","heat","magic","wizards","raptors","celtics","knicks","nets","bulls","bucks","pacers","pistons","cavaliers","cavs","timberwolves","wolves",
+            "patriots","cowboys","eagles","giants","jets","bills","vikings","packers","bears","steelers","ravens","chiefs","broncos","49ers","dolphins","lions",
+            "lebron","james","curry","steph","jokic","doncic","tatum","kyrie","harden",
+            "quarterback","qb","wide receiver","running back","coach","ot","halftime",
+            "homerun","home run","inning","pitcher","strikeout","walk-off",
+            "goal","hat trick","offside","penalty","power play","overtime","shootout",
+            # generic
+            "game tonight","big game","season opener","trade deadline","free agency","playoff spot",
+        ]
+        strong_hits = sum(1 for k in sports_terms if k in t)
+        return strong_hits >= 2 or any(k in t for k in ["super bowl","world series","nba finals","stanley cup"])
 
 
