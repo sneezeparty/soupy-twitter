@@ -128,19 +128,17 @@ class ContextEnricher:
             search_source = self._get_search_context_source(base_context, tweet_text)
             logger.info("Enrichment: deriving brief search context from {}", search_source["source"])
             logger.info("Enrichment: search excerpt => {}", search_source["text"].strip().replace("\n", " ")[:200])
-            # Guard: skip generic web search for off-topic speculative science unless tweet mentions it
+            # Use LLM decision instead of brittle keyword heuristics
             txt_low = search_source["text"].lower()
-            sci_terms = ["multiverse", "quantum", "string theory", "higgs", "cosmology"]
-            if any(t in txt_low for t in sci_terms):
-                # Only allow if tweet explicitly contains the same term
-                tweet_low = (tweet_text or "").lower()
-                if not any(t in tweet_low for t in sci_terms):
-                    logger.info("Enrichment: skipping web search due to speculative-science drift")
-                    search_result = None
-                else:
-                    search_result = self._search_context(search_source["text"], base_context)
-            else:
+            try:
+                do_search = self._llm.should_enrich_with_web_search(tweet_text, (" ".join(details) if details else None))
+            except Exception:
+                do_search = True
+            if do_search:
                 search_result = self._search_context(search_source["text"], base_context)
+            else:
+                logger.info("Enrichment: LLM decided to skip web search for this post")
+                search_result = None
             if search_result:
                 search_bullets, used_urls, query_used = search_result
                 logger.info("Enrichment: search query => {}", query_used)
@@ -207,8 +205,29 @@ class ContextEnricher:
                     used_results = filtered if filtered else results
                 else:
                     used_results = results
-                used_urls = [u for (_, u, _) in used_results]
-                snippets = [s for (_, _, s) in used_results if s]
+                # Prefer reputable news domains to bias timeliness; fall back only if empty
+                NEWS_PREF = {
+                    "apnews.com","reuters.com","bbc.com","nytimes.com","washingtonpost.com","wsj.com","bloomberg.com",
+                    "ft.com","theguardian.com","npr.org","axios.com","politico.com","aljazeera.com","cnn.com","cbsnews.com",
+                    "abcnews.go.com","nbcnews.com","pbs.org","latimes.com","economist.com","thehill.com","vox.com",
+                    "apnews.com","reuters.com","france24.com","dw.com","japantimes.co.jp","scmp.com","straitstimes.com",
+                    "abc.net.au","cbc.ca","rte.ie","euronews.com","independent.co.uk","theatlantic.com","newyorker.com",
+                    "time.com","newsweek.com","usnews.com","foreignpolicy.com","foreignaffairs.com","defenseone.com",
+                    "scientificamerican.com","nature.com","science.org","newscientist.com","technologyreview.com",
+                    "wired.com","arstechnica.com","techcrunch.com","theverge.com","engadget.com","zdnet.com",
+                    "marketwatch.com","cnbc.com","forbes.com","fortune.com","businessinsider.com","hbr.org",
+                    "nationalgeographic.com","smithsonianmag.com","sciencenews.org","sciencedaily.com","phys.org",
+                    "theconversation.com","project-syndicate.org","worldpoliticsreview.com","devex.com","undark.org"
+                }
+                def _domain(u: str) -> str:
+                    try:
+                        return u.split('/')[2] if '://' in u else ''
+                    except Exception:
+                        return ''
+                news_only = [(t, u, s) for (t, u, s) in used_results if any(d in _domain(u) for d in NEWS_PREF)]
+                final = news_only if news_only else used_results
+                used_urls = [u for (_, u, _) in final]
+                snippets = [s for (_, _, s) in final if s]
             # Fallback: include tweet text snippet if search yielded nothing
             if not snippets and tweet_text:
                 snippets.append(tweet_text[:240])
@@ -418,7 +437,13 @@ class ContextEnricher:
         chosen_terms = (terms[:6] + hashtag_terms)[:8]
         if chosen_terms:
             logger.info("Enrichment: chosen terms => {}", ", ".join(chosen_terms))
-        query = " ".join([base_part] + chosen_terms).strip()
+        # Add soft news/recency bias to query
+        try:
+            from datetime import datetime
+            month_token = datetime.utcnow().strftime("%B %Y")
+        except Exception:
+            month_token = "news"
+        query = " ".join([base_part, "news", month_token] + chosen_terms).strip()
         return (query[:160], chosen_terms)
 
     def _get_search_context_source(self, base_context: Optional[Dict], tweet_text: str) -> Dict[str, str]:

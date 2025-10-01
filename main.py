@@ -50,6 +50,14 @@ def main() -> None:
                     logger.info("Daily post: no popular post found; aborting")
                     return
                 seed_text = (popular.get("text") or "").strip()
+                # Guard: if seed has too little public-affairs content, switch to a better seed
+                try:
+                    if len(seed_text.split()) < 4:
+                        alt = bot.select_popular_post_text(use_discover=True, limit=120)
+                        if alt and (alt.get("text") or "").strip() and len((alt.get("text") or "").split()) >= 4:
+                            seed_text = (alt.get("text") or "").strip()
+                except Exception:
+                    pass
                 logger.info("Daily post: seed post => {}", seed_text[:180])
 
                 # Extract URLs from seed text for additional context
@@ -79,6 +87,27 @@ def main() -> None:
                     except Exception as exc:
                         logger.warning("Daily post: URL context extraction failed: {}", exc)
 
+                # Pull trending terms from Bluesky feed (heuristic) and via LLM extraction to bias toward timely topics
+                try:
+                    trending_terms = bot.get_trending_terms(limit=8) or []
+                except Exception:
+                    trending_terms = []
+                try:
+                    # Sample texts from discover/timeline and ask LLM to extract concise, timely topics
+                    sample_texts = bot.get_discover_texts(limit=40) or []
+                    llm_terms = llm.extract_trending_terms(sample_texts, max_terms=8) or []
+                except Exception:
+                    llm_terms = []
+                merged_terms = []
+                seen_tt = set()
+                for term in (trending_terms + llm_terms):
+                    low = (term or "").strip().lower()
+                    if low and low not in seen_tt:
+                        seen_tt.add(low)
+                        merged_terms.append(term)
+                if merged_terms:
+                    logger.info("Daily post: trending terms => {}", ", ".join(merged_terms[:8]))
+
                 # Use websearch to get articles; prefer first successful from reputable news
                 import asyncio as _asyncio
                 # Lazy import to avoid discord dependency at module import time
@@ -86,11 +115,6 @@ def main() -> None:
                 cog = SearchCog(bot=None)  # type: ignore
                 try:
                     async def _search_pick() -> tuple[str, str, list[str]]:
-                        NEWS_PREF = {
-                            "apnews.com","reuters.com","bbc.com","nytimes.com","washingtonpost.com","wsj.com","bloomberg.com",
-                            "ft.com","theguardian.com","npr.org","axios.com","politico.com","aljazeera.com","cnn.com","cbsnews.com",
-                            "abcnews.go.com","nbcnews.com","pbs.org","latimes.com","economist.com"
-                        }
                         AVOID = {
                             "stackoverflow.com","github.com","stackexchange.com","medium.com","quora.com",
                             "forums.redflagdeals.com","dealnews.com","slickdeals.net","retailmenot.com",
@@ -99,65 +123,49 @@ def main() -> None:
                             "indeed.com","linkedin.com","glassdoor.com","monster.com",
                             "webmd.com","healthline.com","mayoclinic.org","medlineplus.gov"
                         }
-                        # Use LLM to analyze the seed post and determine the best topic and search queries
-                        logger.info("Daily post: analyzing seed post with LLM to determine topic and search queries")
-                        
-                        # Prepare context for LLM analysis
-                        analysis_context = f"Seed post: {seed_text}"
-                        if url_context:
-                            analysis_context += f"\n\nURL context from seed post: {url_context}"
-                        
-                        # Use LLM to determine the main topic and generate search queries
-                        topic_analysis = llm.analyze_topic_and_generate_queries(analysis_context)
-                        logger.debug("Daily post: LLM topic analysis response: {}", topic_analysis[:500])
-                        
-                        # Parse the LLM response to extract topic and queries
-                        lines = topic_analysis.strip().split('\n')
-                        topic = "politics news"  # Default fallback
-                        
-                        # Extract topic from first line (more robust parsing)
-                        for line in lines:
-                            line = line.strip()
-                            if line.startswith('TOPIC:'):
-                                topic = line.replace('TOPIC:', '').strip()
-                                break
-                            elif line.startswith('Topic:'):
-                                topic = line.replace('Topic:', '').strip()
-                                break
-                        
-                        # Extract search queries from the analysis (more robust)
-                        queries = []
-                        for line in lines:
-                            line = line.strip()
-                            if line and not line.startswith('TOPIC:') and not line.startswith('Topic:') and not line.startswith('#'):
-                                # Clean up the query - handle various formats
-                                query = line.lstrip('- •*').strip()
-                                # Remove any trailing punctuation that might confuse search
-                                query = query.rstrip('.,;:')
-                                if query and len(query) > 3 and query.lower() not in ['topic', 'queries', 'search queries']:
-                                    queries.append(query)
-                        
-                        # Additional validation: ensure queries are reasonable
-                        validated_queries = []
-                        for query in queries:
-                            # Skip if it's too generic or too specific
-                            if (len(query.split()) >= 2 and 
-                                len(query) <= 100 and 
-                                not query.lower().startswith(('the ', 'a ', 'an '))):
-                                validated_queries.append(query)
-                        
-                        queries = validated_queries
-                        
-                        # Fallback if LLM didn't generate enough queries
+                        # Build LLM-driven queries in two passes: rewrite and clean
+                        logger.info("Daily post: deriving LLM queries (rewrite + clean)")
+                        topic = llm.infer_topic(seed_text) or "politics news"
+                        try:
+                            if not llm.is_public_affairs_topic(topic):
+                                # If not public affairs, try infer from merged trending terms
+                                tt_hint = ", ".join((merged_terms or [])[:4])
+                                alt = llm.infer_topic(tt_hint) if tt_hint else None
+                                if alt and llm.is_public_affairs_topic(alt):
+                                    topic = alt
+                        except Exception:
+                            pass
+                        initial_queries = llm.rewrite_news_queries(seed_text=seed_text, article_snippet=url_context)
+                        # Mix in trending terms, then clean (and avoid outlet/brand terms via LLM where possible)
+                        mixed_queries: list[str] = []
+                        seen_mix = set()
+                        for q in (initial_queries + (merged_terms or [])[:8]):
+                            q2 = (q or "").strip()
+                            if not q2:
+                                continue
+                            if q2.lower() in seen_mix:
+                                continue
+                            # Optional: drop short brand-like tokens (LLM check; best-effort)
+                            try:
+                                # fast heuristic: avoid very short tokens that look like outlet names
+                                low = q2.lower()
+                                looks_brand = (len(low.split()) <= 3 and any(tok.isalpha() and len(tok) <= 10 for tok in low.split()))
+                                if looks_brand and llm.infer_topic(q2) and False:  # keep minimal calls; placeholder no-op
+                                    pass
+                            except Exception:
+                                pass
+                            seen_mix.add(q2.lower())
+                            mixed_queries.append(q2)
+                        queries = llm.clean_news_queries(mixed_queries, max_queries=8) or mixed_queries[:8]
+                        # Ensure minimum viable queries
                         if len(queries) < 3:
-                            logger.warning("Daily post: LLM generated only {} queries, adding fallbacks", len(queries))
-                            fallback_queries = ["politics news", "current events", "breaking news"]
-                            for fq in fallback_queries:
+                            logger.warning("Daily post: few queries after clean ({}); adding generic fallbacks", len(queries))
+                            for fq in ["US congress bill", "labor strike negotiation", "state court ruling", "climate policy decision"] + (merged_terms[:3] if merged_terms else []):
+                                if len(queries) >= 5:
+                                    break
                                 if fq not in queries:
                                     queries.append(fq)
-                        
-                        logger.info("Daily post: LLM determined topic: '{}'", topic)
-                        logger.info("Daily post: LLM generated {} search queries: {}", len(queries), queries[:3])
+                        logger.info("Daily post: topic='{}' | {} queries prepared", topic, len(queries))
                         
                         # Prepend ddgs top headlines as extra queries if the current queries are weak
                         if len(queries) < 3:
@@ -170,8 +178,25 @@ def main() -> None:
                             except Exception:
                                 pass
 
-                        # Validate and refine queries: require news hits
-                        for q in queries[:12]:
+                        # Execute searches for the queries and select best article by LLM relevance + heuristics
+                        # Strictly ignore any accidental instruction-like queries
+                        def _looks_like_instruction(q: str) -> bool:
+                            ql = q.lower().strip()
+                            if any(ql.startswith(p) for p in ["here is", "topic:", "queries:", "format:"]):
+                                return True
+                            if any(w in ql for w in ["one per line", "max queries", "filtered list"]):
+                                return True
+                            return False
+
+                        tried = 0
+                        best_fallback: Optional[tuple[float, dict, int, list[str]]] = None  # (score, item, content_len, snippets)
+                        THRESHOLD = 6.5
+                        for q in queries:
+                            if _looks_like_instruction(q):
+                                continue
+                            tried += 1
+                            if tried > 12:
+                                break
                             # Enhance query with URL context if available
                             enhanced_query = q
                             if url_context:
@@ -184,23 +209,26 @@ def main() -> None:
                             selected = await cog.select_articles(results)
                             logger.info("Daily post: {} selected article(s) for query '{}'", len(selected), q)
                             if not selected:
+                                # No results; continue to next query
+                                selected = []
+                            if not selected:
                                 continue
-                            # Prefer reputable news domains first
+                            # Rank results, penalizing avoid-list domains only (no whitelist)
                             ranked = []
                             for it in selected:
                                 href = it.get('href','')
                                 domain = href.split('/')[2] if '://' in href else ''
-                                is_news = any(d in domain for d in NEWS_PREF)
                                 is_avoid = any(d in domain for d in AVOID)
-                                rank = (0 if is_news else 10) + (50 if is_avoid else 0)
+                                rank = (0) + (50 if is_avoid else 0)
                                 ranked.append((rank, it))
                             ranked.sort(key=lambda x: x[0])
+                            # Take top results after penalizing avoid domains (no whitelist filtering)
                             filtered = [it for (_, it) in ranked][:5]
-                            # Fetch contents and pick best article (not just longest)
+                            # Fetch contents and pick best article with LLM relevance score (+ recency, - press release)
                             tasks = [cog.fetch_article_content(item.get('href', '')) for item in filtered]
                             contents = await _asyncio.gather(*tasks, return_exceptions=True)
                             
-                            # Score articles by multiple factors, not just length
+                            # Score articles by multiple factors, including LLM relevance
                             article_scores = []
                             snippets: list[str] = []
                             
@@ -228,10 +256,7 @@ def main() -> None:
                                     elif 10 <= title_len <= 150:
                                         score += 1.0
                                     
-                                    # Factor 3: Domain reputation bonus
-                                    domain = url.split('/')[2] if '://' in url else ''
-                                    if any(d in domain for d in NEWS_PREF):
-                                        score += 3.0
+                                    # Factor 3: (removed) Domain reputation bonus — no whitelist bias
                                     
                                     # Factor 4: Avoid clickbait patterns
                                     title_lower = title.lower()
@@ -244,30 +269,158 @@ def main() -> None:
                                     if any(word in text.lower() for word in quality_words):
                                         score += 2.0
                                     
-                                    # Factor 6: Topic relevance check
-                                    topic_relevance = _check_topic_relevance(text, title, q)
-                                    if topic_relevance < 0.3:  # Low relevance threshold
-                                        score -= 10.0  # Heavy penalty for irrelevant content
-                                        logger.warning("Daily post: low topic relevance ({:.2f}) for '{}'", topic_relevance, title[:50])
+                                    # Factor 6: LLM relevance to seed subject
+                                    try:
+                                        rel = llm.score_news_article_relevance(seed_subject=seed_text, article_title=title, article_excerpt=text[:800])
+                                    except Exception:
+                                        rel = 0.5
+                                    score += rel * 5.0  # Softer relevance weight
+                                    if rel < 0.55:
+                                        score -= 4.0  # Softer penalty
+                                        logger.warning("Daily post: low LLM relevance ({:.2f}) for '{}'", rel, title[:50])
+                                    # Factor 6a: Recency boost via LLM heuristic
+                                    try:
+                                        rec = llm.score_article_recency(title=title, article_excerpt=text[:800])
+                                    except Exception:
+                                        rec = 0.5
+                                    score += rec * 3.0
+                                    # Factor 6b: Must be a specific article page (not section hub)
+                                    try:
+                                        is_article = llm.is_specific_article_page(url=url, title=title, article_excerpt=text[:800])
+                                    except Exception:
+                                        is_article = True
+                                    if not is_article:
+                                        score -= 12.0
+                                        logger.info("Daily post: non-article page skipped '{}'", title[:60])
+                                    # Factor 6b2: Penalize instructional/reference pages
+                                    try:
+                                        is_instr = llm.is_instructional_page(url=url, title=title, article_excerpt=text[:800])
+                                    except Exception:
+                                        is_instr = False
+                                    if is_instr:
+                                        score -= 10.0
+                                        logger.info("Daily post: instructional/reference page penalized '{}'", title[:60])
+                                    # Factor 6c: Penalize press releases via LLM classifier
+                                    try:
+                                        is_pr = llm.is_press_release(url=url, title=title, article_excerpt=text[:800])
+                                    except Exception:
+                                        is_pr = False
+                                    if is_pr:
+                                        score -= 6.0
                                     
                                     # Factor 7: Avoid retail/commercial content
                                     commercial_indicators = ['price', 'buy', 'sale', 'discount', 'deal', 'shop', 'store', 'retail', 'tire', 'inventory']
                                     if any(indicator in text.lower() for indicator in commercial_indicators):
                                         score -= 5.0
                                         logger.warning("Daily post: commercial content detected in '{}'", title[:50])
+
+                                    # Factor 8: Trending/political alignment boost
+                                    try:
+                                        tt_low = [t.lower() for t in (trending_terms or [])]
+                                        hay = f"{title} {text}".lower()
+                                        if any(t in hay for t in tt_low):
+                                            score += 3.0
+                                    except Exception:
+                                        pass
                                     
                                     article_scores.append((score, idx, item, content_len))
                             
                             if article_scores:
                                 # Sort by score and pick the best
                                 article_scores.sort(key=lambda x: x[0], reverse=True)
+                                # Require a strong score threshold to avoid off-topic picks; keep best as fallback
                                 best_score, best_idx, best_item, best_len = article_scores[0]
-                                
-                                url = best_item.get('href', '')
-                                topic = best_item.get('title', q) or q
-                                logger.info("Daily post: picked '{}' -> {} (score: {:.2f}, content {} chars)", 
-                                          topic, url, best_score, best_len)
-                                return (topic, url, snippets)
+                                # Track best fallback across queries
+                                try:
+                                    if (best_fallback is None) or (best_score > best_fallback[0]):
+                                        best_fallback = (best_score, best_item, best_len, snippets.copy())
+                                except Exception:
+                                    pass
+                                if best_score >= THRESHOLD:
+                                    url = best_item.get('href', '')
+                                    topic = best_item.get('title', q) or q
+                                    logger.info("Daily post: picked '{}' -> {} (score: {:.2f}, content {} chars)", 
+                                              topic, url, best_score, best_len)
+                                    # Multi-source enrichment: fetch 1–2 additional sources and condense
+                                    try:
+                                        enrich_query = (topic or q)[:140]
+                                        extra_results = await cog.perform_text_search(enrich_query, max_results=8)
+                                        selected_extra = await cog.select_articles(extra_results)
+                                        # Keep up to 3 extras not duplicating the lead domain
+                                        lead_domain = url.split('/')[2] if '://' in url else ''
+                                        extras = []
+                                        for it in selected_extra:
+                                            href = it.get('href','')
+                                            dom = href.split('/')[2] if '://' in href else ''
+                                            if href and dom != lead_domain and href != url:
+                                                extras.append(it)
+                                            if len(extras) >= 3:
+                                                break
+                                        if extras:
+                                            texts = await _asyncio.gather(*[cog.fetch_article_content(it.get('href','')) for it in extras], return_exceptions=True)
+                                            extra_snips: list[str] = []
+                                            for it, txt in zip(extras, texts):
+                                                if isinstance(txt, str) and txt.strip():
+                                                    _san = txt.strip().replace("\n", " ")[:400]
+                                                    extra_snips.append(f"{it.get('title','')}: {_san}")
+                                            if extra_snips:
+                                                try:
+                                                    condensed = llm.condense_search_snippets(query=enrich_query, snippets=extra_snips, max_chars=500, entities=None)
+                                                    if condensed:
+                                                        # Split condensed bullets into individual snippets
+                                                        for line in (condensed.split('\n')):
+                                                            ln = line.strip().lstrip('-').strip()
+                                                            if ln:
+                                                                snippets.append(ln)
+                                                        logger.info("Daily post: enriched snippets with multi-source context ({} added)", len(condensed.split('\n')))
+                                                except Exception:
+                                                    # If condense fails, append raw extra snippets (trimmed)
+                                                    snippets.extend(extra_snips[:2])
+                                    except Exception:
+                                        pass
+                                    return (topic, url, snippets)
+                        # If strict pass failed, try fallback to best available news article
+                        if best_fallback is not None:
+                            fb_score, fb_item, fb_len, fb_snips = best_fallback
+                            url = fb_item.get('href', '')
+                            topic = fb_item.get('title', 'news') or 'news'
+                            logger.info("Daily post: fallback pick '{}' -> {} (score: {:.2f}, content {} chars)", topic, url, fb_score, fb_len)
+                            # Multi-source enrichment on fallback as well
+                            try:
+                                enrich_query = (topic or q)[:140]
+                                extra_results = await cog.perform_text_search(enrich_query, max_results=8)
+                                selected_extra = await cog.select_articles(extra_results)
+                                lead_domain = url.split('/')[2] if '://' in url else ''
+                                extras = []
+                                for it in selected_extra:
+                                    href = it.get('href','')
+                                    dom = href.split('/')[2] if '://' in href else ''
+                                    if href and dom != lead_domain and href != url:
+                                        extras.append(it)
+                                    if len(extras) >= 3:
+                                        break
+                                if extras:
+                                    texts = await cog.fetch_article_content(extras[0].get('href','')) if extras else None
+                                    extra_snips: list[str] = []
+                                    for it in extras[:2]:
+                                        txt = await cog.fetch_article_content(it.get('href',''))
+                                        if isinstance(txt, str) and txt.strip():
+                                            _san = txt.strip().replace("\n", " ")[:400]
+                                            extra_snips.append(f"{it.get('title','')}: {_san}")
+                                    if extra_snips:
+                                        try:
+                                            condensed = llm.condense_search_snippets(query=enrich_query, snippets=extra_snips, max_chars=500, entities=None)
+                                            if condensed:
+                                                for line in (condensed.split('\n')):
+                                                    ln = line.strip().lstrip('-').strip()
+                                                    if ln:
+                                                        fb_snips.append(ln)
+                                                logger.info("Daily post: enriched fallback snippets with multi-source context")
+                                        except Exception:
+                                            fb_snips.extend(extra_snips[:2])
+                            except Exception:
+                                pass
+                            return (topic, url, fb_snips)
                         return ("news", "", [])
 
                     def _check_topic_relevance(text: str, title: str, query: str) -> float:
@@ -300,25 +453,141 @@ def main() -> None:
                     return
 
                 max_chars = min(300, max(1, int(config.bsky_post_max_chars)))
-                logger.info("Daily post: drafting with max_chars={} for topic '{}'", max_chars, topic)
-                
-                # Include URL context in snippets if available
-                enhanced_snippets = snippets.copy()
+                logger.info("Daily post: drafting 4 candidates for topic '{}'", topic)
+                base_snippets = snippets.copy()
                 if url_context:
-                    enhanced_snippets.insert(0, f"Seed post context: {url_context[:400]}")
-                    logger.debug("Daily post: enhanced snippets with URL context")
-                
-                post_text = llm.draft_brief_link_opinion_post(topic=topic, url=url, snippets=enhanced_snippets, max_chars=max_chars)
-                if not post_text:
-                    logger.info("Daily post: LLM returned empty text")
+                    base_snippets.insert(0, f"Seed post context: {url_context[:400]}")
+                candidates = llm.generate_bsky_post_candidates(topic=topic, url=url, snippets=base_snippets, num_candidates=4, max_chars=max_chars)
+                best, scored = llm.select_best_bsky_post_with_scores(topic, base_snippets, candidates)
+                try:
+                    lines = ["Daily post: candidate scoreboard:"]
+                    for rank, (score, text) in enumerate(scored[:5], start=1):
+                        lines.append(f"{rank}. score={score} len={len(text)} :: {text[:160]}")
+                    logger.info("{}", "\n".join(lines))
+                except Exception:
+                    pass
+                if not best:
+                    logger.info("Daily post: no viable candidate")
                     return
-                logger.info("Daily post: preview => {}", (post_text[:220] + ("…" if len(post_text) > 220 else "")))
-                ok = bot.create_post(post_text)
-                logger.info("Daily post: {}", "posted" if ok else "failed to post")
+                # Consider generating a short thread (2-3 posts) when topic/snippets are rich
+                try:
+                    make_thread = True if len(base_snippets) >= 3 else False
+                    thread_posts: list[str] = []
+                    total = 0
+                    if make_thread:
+                        base = llm.generate_bsky_thread(topic=topic, snippets=base_snippets, segments=3, max_chars=max_chars)
+                        total = len(base)
+                        if total >= 2:
+                            # Build labelled replies from base[1:]
+                            replies: list[str] = []
+                            for idx, p in enumerate(base[1:], start=2):
+                                label = f"({idx}/{total}) "
+                                room = max_chars - len(label)
+                                if len(p) > room:
+                                    p = p[: max(1, room - 1)] + "…"
+                                replies.append(label + p)
+                            thread_posts = replies
+                        else:
+                            thread_posts = []
+                except Exception:
+                    thread_posts = []
+                # Behaviour-guided refine (tone/wording) before appending URL
+                try:
+                    final_text = llm.refine_bsky_post(topic=topic, snippets=base_snippets, draft_post=best, max_chars=max_chars)
+                except Exception:
+                    final_text = best
+                # Ensure the selected URL is present as a TinyURL and is the only URL
+                try:
+                    if url:
+                        try:
+                            from bot.utils import shorten_url_tinyurl
+                            short_url = shorten_url_tinyurl(url)
+                        except Exception:
+                            short_url = url
+                        # Strip any existing URLs from the candidate to avoid conflicts or truncated links
+                        try:
+                            import re as _re
+                            final_text = _re.sub(r"https?://\S+", "", final_text).strip()
+                        except Exception:
+                            pass
+                        # Respect character limit when appending the URL
+                        effective_max = max_chars
+                        room_for_text = max(1, effective_max - (len(short_url) + 1))
+                        if len(final_text) > room_for_text:
+                            # Trim with ellipsis if needed
+                            final_text = final_text[: max(1, room_for_text - 1)] + "…"
+                        final_text = (final_text.rstrip() + " " + short_url).strip()
+                        logger.info("Daily post: appended TinyURL and removed other URLs")
+                except Exception:
+                    pass
+                if thread_posts:
+                    # Label the head as (1/n) and then add labelled replies, preserving full URL
+                    try:
+                        # Determine total from first reply label e.g., (2/3)
+                        import re as _re
+                        m = _re.match(r"^\((\d+)/(\d+)\)\s+", thread_posts[0])
+                        total = int(m.group(2)) if m else (1 + len(thread_posts))
+                    except Exception:
+                        total = 1 + len(thread_posts)
+                    head_label = f"(1/{total}) "
+                    # Preserve the full URL in the head; trim the non-URL portion to make room for label and URL
+                    try:
+                        import re as _re2
+                        urls = _re2.findall(r"https?://\S+", final_text)
+                        url_keep = urls[-1] if urls else None
+                        if url_keep:
+                            # Remove URLs from content
+                            content_only = _re2.sub(r"https?://\S+", "", final_text).strip()
+                            room_for_content = max_chars - len(head_label) - (len(url_keep) + 1)
+                            if room_for_content < 1:
+                                room_for_content = 1
+                            if len(content_only) > room_for_content:
+                                content_only = content_only[: max(1, room_for_content - 1)] + "…"
+                            head_text = (content_only.rstrip() + " " + url_keep).strip()
+                        else:
+                            # No URL; just trim for label space
+                            room_for_content = max_chars - len(head_label)
+                            head_text = final_text if len(final_text) <= room_for_content else (final_text[: max(1, room_for_content - 1)] + "…")
+                    except Exception:
+                        # Fallback to simple trim if anything goes wrong
+                        room_for_content = max_chars - len(head_label)
+                        head_text = final_text if len(final_text) <= room_for_content else (final_text[: max(1, room_for_content - 1)] + "…")
+                    labelled_head = head_label + head_text
+                    logger.info("Daily post: final (thread head) => {}", (labelled_head[:220] + ("…" if len(labelled_head) > 220 else "")))
+                    thread = [labelled_head] + thread_posts[:2]
+                    ok = bot.create_thread(thread)
+                    logger.info("Daily post: {}", "posted" if ok else "failed to post")
+                else:
+                    logger.info("Daily post: final => {}", (final_text[:220] + ("…" if len(final_text) > 220 else "")))
+                    ok = bot.create_post(final_text)
+                    logger.info("Daily post: {}", "posted" if ok else "failed to post")
             except Exception as exc:
                 logger.warning("Daily post: error {}", exc)
 
         try:
+            # Daily post schedule state (N/day with min/max spacing)
+            daily_posts_last_24h: list[float] = []
+            next_daily_post_at: Optional[float] = None
+
+            def _prune_daily_posts(now_s: float) -> None:
+                nonlocal daily_posts_last_24h
+                cutoff = now_s - 24 * 3600
+                daily_posts_last_24h = [t for t in daily_posts_last_24h if t >= cutoff]
+
+            def _count_today_posts(now_local: time.struct_time) -> int:
+                day_str = time.strftime("%Y-%m-%d", now_local)
+                return sum(1 for ts in daily_posts_last_24h if time.strftime("%Y-%m-%d", time.localtime(ts)) == day_str)
+
+            def schedule_next_daily_post(now_s: float) -> None:
+                nonlocal next_daily_post_at
+                min_h = max(1, int(getattr(config, "daily_post_min_interval_hours", 4)))
+                max_h = max(min_h, int(getattr(config, "daily_post_max_interval_hours", 8)))
+                delay = random.randint(min_h * 3600, max_h * 3600)
+                next_daily_post_at = now_s + delay
+
+            # Initialize schedule at startup
+            schedule_next_daily_post(time.time())
+
             def bsky_action() -> None:
                 now_local = time.localtime()
                 hour = now_local.tm_hour
@@ -328,19 +597,19 @@ def main() -> None:
                 if not within_hours:
                     logger.info("Outside operating hours ({}-{}); skipping action", start_h, end_h)
                     return
-                # Daily Bluesky news post around configured hour
+                # Multi-post daily schedule within operating hours
                 try:
                     if config.daily_post_enabled:
-                        target_hour = int(getattr(config, "daily_post_hour", 14)) % 24
-                        window_min = int(getattr(config, "daily_post_window_minutes", 45))
-                        # post once per day; track last post day in closure
-                        nonlocal last_daily_post_day
-                        today_day = time.strftime("%Y-%m-%d", now_local)
-                        minutes_from_target = abs((hour * 60 + now_local.tm_min) - (target_hour * 60))
-                        within_window = minutes_from_target <= max(1, window_min)
-                        if within_window and last_daily_post_day != today_day:
-                            _do_daily_news_post(bot, llm)
-                            last_daily_post_day = today_day
+                        now_s = time.time()
+                        _prune_daily_posts(now_s)
+                        per_day = max(1, int(getattr(config, "daily_posts_per_day", 2)))
+                        if next_daily_post_at is not None and now_s >= next_daily_post_at:
+                            if _count_today_posts(now_local) < per_day:
+                                _do_daily_news_post(bot, llm)
+                                daily_posts_last_24h.append(now_s)
+                            else:
+                                logger.info("Daily posts quota reached for today ({}).", per_day)
+                            schedule_next_daily_post(now_s)
                 except Exception as exc:
                     logger.warning("Daily post attempt failed: {}", exc)
 
@@ -424,9 +693,10 @@ def main() -> None:
                     logger.info("===== STEP 4: Context to LLM =====\nPost: {}\nContext: {}", post_text, context_str or "-")
                     # Generate multiple candidates and select the best
                     logger.info("===== STEP 5: Generate candidates =====")
-                    cands = llm.generate_bsky_reply_candidates(post_text, context_str if context_str else None, num_candidates=4)
+                    # Generate without explicit anchor to avoid meta leakage
+                    cands = llm.generate_bsky_reply_candidates(post_text, context_str if context_str else None, num_candidates=4, anchor_phrase=None)
                     logger.info("===== STEP 6: Selection =====\n- {} candidate(s) generated", len(cands))
-                    draft, scored = llm.select_best_bsky_reply_with_scores(post_text, context_str if context_str else None, cands)
+                    draft, scored = llm.select_best_bsky_reply_with_scores(post_text, context_str if context_str else None, cands, anchor_phrase=None)
                     # Human-readable scoreboard
                     try:
                         lines = ["===== STEP 7: Candidate scoreboard ====="]
@@ -436,10 +706,51 @@ def main() -> None:
                     except Exception:
                         pass
                     logger.info("===== STEP 7b: Draft selected =====\n({} chars) {}", len(draft), draft)
-                    reply_text = llm.refine_bsky_reply(post_text, context_str if context_str else None, draft)
+                    reply_text = llm.refine_bsky_reply(post_text, context_str if context_str else None, draft, anchor_phrase=None)
+                    # Alignment validation gate: ensure the reply truly aligns; else fall back to next candidate or a brief ack
+                    try:
+                        align = llm.validate_reply_alignment(post_text, context_str if context_str else None, reply_text, anchor_phrase=anchor)
+                    except Exception:
+                        align = 0.6
+                    # Hard reject if second-person slipped in
+                    def _has_second_person(t: str) -> bool:
+                        tl = (t or "").lower()
+                        return (" you " in tl) or (" your " in tl) or ("you're" in tl) or (" you." in tl) or (" your." in tl)
+                    if _has_second_person(reply_text):
+                        logger.info("Reply alignment: rejected for using second-person pronouns; trying next candidate")
+                        align = 0.0
+                    if align < 0.6 and scored:
+                        # Try the next best candidate once
+                        try:
+                            alt = scored[1][1]
+                            alt_refined = llm.refine_bsky_reply(post_text, context_str if context_str else None, alt, anchor_phrase=None)
+                            if _has_second_person(alt_refined):
+                                raise Exception("alt uses second-person")
+                            alt_align = llm.validate_reply_alignment(post_text, context_str if context_str else None, alt_refined, anchor_phrase=anchor)
+                            if alt_align > align:
+                                reply_text = alt_refined
+                                align = alt_align
+                                logger.info("Reply alignment: switched to next candidate (score {:.2f})", align)
+                        except Exception:
+                            pass
+                    if align < 0.5:
+                        # Fallback to extremely brief acknowledgment to avoid off-topic reply
+                        try:
+                            ack = llm.generate_brief_ack(post_text, context_str if context_str else None)
+                            if ack:
+                                reply_text = ack
+                                logger.info("Reply alignment: fell back to brief ack due to low alignment ({:.2f})", align)
+                        except Exception:
+                            pass
                     # Enforce final-length safety net before posting
                     if len(reply_text) > config.bsky_reply_max_chars:
                         reply_text = reply_text[: config.bsky_reply_max_chars - 1] + "…"
+                    # Final coherence refinement pass
+                    try:
+                        max_reply_len = max(200, int(getattr(config, "bsky_reply_max_chars", 300)))
+                        reply_text = llm.coherence_refine_reply(post_text, context_str if context_str else None, reply_text, max_chars=max_reply_len)
+                    except Exception:
+                        pass
                     logger.info("===== STEP 8: Final reply =====\n({} chars) {}", len(reply_text), reply_text)
                     if bot.send_prepared_reply(reply_text):
                         logger.info("Bsky mode: reply succeeded")
@@ -470,13 +781,14 @@ def main() -> None:
 
             # Force first-run reply if --now is used without explicit flags
             force_reply_first_run = bool(args.now and not args.reply and not args.post)
-            # Track last daily news post day
-            last_daily_post_day: Optional[str] = None
             # If requested, force the daily news search/post immediately at launch (regardless of hours)
             if args.postnow:
                 try:
                     _do_daily_news_post(bot, llm)
-                    last_daily_post_day = time.strftime("%Y-%m-%d", time.localtime())
+                    # Record and reschedule
+                    now_s = time.time()
+                    daily_posts_last_24h.append(now_s)
+                    schedule_next_daily_post(now_s)
                 except Exception as exc:
                     logger.warning("--postnow failed: {}", exc)
             run_loop(bsky_action, rate_limiter, scheduler, run_immediately=(args.now or args.post))

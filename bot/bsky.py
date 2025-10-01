@@ -105,8 +105,14 @@ class BskyBot:
                 return []
 
             STOP = {
-                "from","to","subject","time","help","all","yours","friday","monday","tuesday","wednesday","thursday","saturday","sunday",
-                "today","tomorrow","yesterday","breaking","update","thread","read","link","please","thanks","amp","http","https"
+                # generic
+                "the","a","an","and","or","but","if","because","so","of","in","on","for","at","by","with","from","to","into","over","under","about",
+                "this","that","these","those","it","its","is","are","was","were","be","been","being",
+                "i","you","we","they","he","she","my","your","our","their","his","her","yes","no","ok","okay","bye","wow","lol","omg","rt",
+                # dates/days
+                "friday","monday","tuesday","wednesday","thursday","saturday","sunday","today","tomorrow","yesterday",
+                # social/meta
+                "breaking","update","thread","read","link","please","thanks","amp","http","https"
             }
             POL = {
                 "election","vote","voting","ballot","congress","senate","house","supreme court","scotus","union","strike","labor",
@@ -127,12 +133,15 @@ class BskyBot:
                     freq[k] = freq.get(k, 0) + 1
                     if any(p in tl for p in POL):
                         pol_boost[k] = pol_boost.get(k, 0) + 1
-                # Proper noun phrases up to 4 words
-                for m in re.findall(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})\b", t):
+                # Proper noun phrases: require multi-word (avoid single-word starters like 'This')
+                for m in re.findall(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b", t):
                     k = m.strip()
-                    if not k or len(k) < 3:
+                    if not k:
                         continue
                     if k.lower() in STOP:
+                        continue
+                    # skip very short tokens inside phrase
+                    if any(len(part) < 3 for part in k.split()):
                         continue
                     freq[k] = freq.get(k, 0) + 1
                     if any(p in tl for p in POL):
@@ -141,8 +150,11 @@ class BskyBot:
             if not freq:
                 return []
             # Score = freq + 2*political boost; minor length penalty to prefer concise topics
+            # Enforce minimum frequency to reduce noise
             scored = sorted(
-                freq.items(), key=lambda kv: (kv[1] + 2*pol_boost.get(kv[0], 0) - 0.01*len(kv[0])), reverse=True
+                ((term, count) for term, count in freq.items() if count >= 2 and term.lower() not in STOP),
+                key=lambda kv: (kv[1] + 2*pol_boost.get(kv[0], 0) - 0.01*len(kv[0])),
+                reverse=True,
             )
             # Deduplicate case-insensitively, keep original form as key string
             seen_lower: set[str] = set()
@@ -589,9 +601,12 @@ class BskyBot:
             if og_description and og_description.get("content"):
                 description = og_description["content"].strip()
             
-            og_image = soup.find("meta", property="og:image")
+            og_image = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "og:image"})
+            tw_image = soup.find("meta", attrs={"name": "twitter:image"}) or soup.find("meta", property="twitter:image" )
             if og_image and og_image.get("content"):
-                image_url = og_image["content"].strip()
+                image_url = og_image.get("content", "").strip()
+            elif tw_image and tw_image.get("content"):
+                image_url = tw_image.get("content", "").strip()
                 # Convert relative URLs to absolute
                 if not image_url.startswith(('http://', 'https://')):
                     image_url = urljoin(url, image_url)
@@ -640,6 +655,8 @@ class BskyBot:
         """
         try:
             import requests
+            import io
+            from PIL import Image
             
             # Fetch the image
             headers = {
@@ -656,18 +673,79 @@ class BskyBot:
                 logger.warning("Bsky: URL does not appear to be an image: {}", image_url)
                 return None
             
-            # Check file size (limit to 1MB as per BlueSky docs)
-            if len(resp.content) > 1000000:
-                logger.warning("Bsky: image too large ({} bytes), skipping", len(resp.content))
-                return None
-            
-            # Upload as blob using the correct API call from BlueSky docs
-            blob_resp = self._client.com.atproto.repo.upload_blob(
-                data=resp.content
-            )
-            
-            logger.debug("Bsky: uploaded image blob for {} (size: {} bytes)", image_url, len(resp.content))
-            return blob_resp.blob
+            data_bytes = resp.content
+            orig_size = len(data_bytes)
+            logger.debug("Bsky: fetched image {} (content-type: {}, size: {} bytes)", image_url, content_type, orig_size)
+
+            # Helper: aggressively compress to target under ~950 KB
+            def _compress_to_target(raw: bytes) -> Optional[tuple[bytes, str]]:
+                try:
+                    img = Image.open(io.BytesIO(raw))
+                    # Always convert to JPEG to reduce size; strip alpha by white background
+                    if img.mode not in ("RGB", "L"):
+                        img = img.convert("RGB")
+                    # Downscale to 1024 max dimension while preserving aspect
+                    max_dim = 1024
+                    w, h = img.size
+                    if w > max_dim or h > max_dim:
+                        img.thumbnail((max_dim, max_dim))
+                    # Try multiple quality levels
+                    for q in (80, 70, 60):
+                        buf = io.BytesIO()
+                        try:
+                            img.save(
+                                buf,
+                                format="JPEG",
+                                quality=q,
+                                optimize=True,
+                                progressive=True,
+                            )
+                        except Exception:
+                            # Fallback without progressive if PIL complains
+                            buf = io.BytesIO()
+                            img.save(buf, format="JPEG", quality=q, optimize=True)
+                        out = buf.getvalue()
+                        if len(out) <= 950_000:
+                            return (out, "image/jpeg")
+                    # Last resort: force 50 quality
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=50, optimize=True)
+                    out = buf.getvalue()
+                    if len(out) <= 1_000_000:
+                        return (out, "image/jpeg")
+                    return None
+                except Exception as exc:
+                    logger.warning("Bsky: compression failed: {}", exc)
+                    return None
+
+            # Compress if needed or if content-type isn't friendly
+            enc = content_type
+            if orig_size > 950_000 or not enc.startswith("image/jpeg"):
+                comp = _compress_to_target(data_bytes)
+                if not comp:
+                    logger.warning("Bsky: image still too large or could not compress ({} bytes)", orig_size)
+                    return None
+                data_bytes, enc = comp
+
+            # Upload as blob using the API; try with encoding hint first, then fallback
+            blob_resp = None
+            try:
+                blob_resp = self._client.com.atproto.repo.upload_blob(data=data_bytes, encoding=enc)
+            except Exception as exc:
+                logger.warning("Bsky: upload_blob with encoding failed ({}), retrying without encoding", exc)
+                try:
+                    blob_resp = self._client.com.atproto.repo.upload_blob(data=data_bytes)
+                except Exception as exc2:
+                    # Best-effort diagnostics
+                    logger.warning("Bsky: upload_blob failed: {} | size={} | encoding={} | url={}", exc2, len(data_bytes), enc, image_url)
+                    return None
+
+            try:
+                size_up = len(data_bytes)
+            except Exception:
+                size_up = -1
+            logger.debug("Bsky: uploaded image blob for {} (size: {} bytes, encoding: {})", image_url, size_up, enc)
+            return getattr(blob_resp, 'blob', None)
             
         except Exception as exc:
             logger.warning("Bsky: failed to upload image blob for {}: {}", image_url, exc)
@@ -678,7 +756,11 @@ class BskyBot:
         try:
             # Enforce Bluesky max graphemes (hard limit is 300)
             max_len = min(300, max(1, int(getattr(self._config, "bsky_post_max_chars", 300))))
-            safe_text = text if len(text) <= max_len else (text[: max_len - 1] + "…")
+            # Sanitize and enforce max using LLM client's sanitizer to avoid weird symbols
+            try:
+                safe_text = self._llm.sanitize_for_bsky(text, max_len)
+            except Exception:
+                safe_text = text if len(text) <= max_len else (text[: max_len - 3] + "...")
             
             # Check if the post contains a URL and create external embed
             embed = self._create_external_embed(safe_text)
@@ -705,6 +787,97 @@ class BskyBot:
             return True
         except Exception as exc:
             logger.error("Bsky: failed to post: {}", exc)
+            return False
+
+    def create_thread(self, posts: list[str]) -> bool:
+        """Create a thread: post head, then replies chained to the previous.
+
+        Returns True if head posted; replies best-effort.
+        """
+        try:
+            if not posts:
+                return False
+            # Head post
+            head_text = posts[0]
+            max_len = min(300, max(1, int(getattr(self._config, "bsky_post_max_chars", 300))))
+            try:
+                head_text = self._llm.sanitize_for_bsky(head_text, max_len)
+            except Exception:
+                if len(head_text) > max_len:
+                    head_text = head_text[: max_len - 3] + "..."
+            embed = self._create_external_embed(head_text)
+            facets = self._create_url_facets(head_text)
+            resp = None
+            if embed:
+                if facets:
+                    resp = self._client.send_post(text=head_text, embed=embed, facets=facets)
+                else:
+                    resp = self._client.send_post(text=head_text, embed=embed)
+            else:
+                if facets:
+                    resp = self._client.send_post(text=head_text, facets=facets)
+                else:
+                    resp = self._client.send_post(text=head_text)
+            # Extract uri/cid of head
+            try:
+                head_uri = getattr(resp, "uri", None) if resp is not None else None
+                head_cid = getattr(resp, "cid", None) if resp is not None else None
+                if head_uri is None and isinstance(resp, dict):
+                    head_uri = resp.get("uri")
+                    head_cid = resp.get("cid")
+            except Exception:
+                head_uri, head_cid = None, None
+            logger.info("Bsky: posted thread head ({} chars)", len(head_text))
+            if not head_uri or not head_cid:
+                # Cannot chain replies without head identifiers; stop here
+                return True
+            # Chain replies
+            parent_uri = head_uri
+            parent_cid = head_cid
+            for idx, text in enumerate(posts[1:], start=2):
+                if not text:
+                    continue
+                try:
+                    max_reply = min(300, max(1, int(getattr(self._config, "bsky_reply_max_chars", 300))))
+                    try:
+                        safe = self._llm.sanitize_for_bsky(text, max_reply)
+                    except Exception:
+                        safe = text if len(text) <= max_reply else (text[: max_reply - 3] + "...")
+                    # Avoid adding new external embeds in replies unless URLs are present
+                    embed_r = self._create_external_embed(safe)
+                    facets_r = self._create_url_facets(safe)
+                    reply_ref = bsky_models.AppBskyFeedPost.ReplyRef(
+                        root=bsky_models.ComAtprotoRepoStrongRef.Main(uri=head_uri, cid=head_cid),
+                        parent=bsky_models.ComAtprotoRepoStrongRef.Main(uri=parent_uri, cid=parent_cid),
+                    )
+                    rresp = None
+                    if embed_r:
+                        if facets_r:
+                            rresp = self._client.send_post(text=safe, reply_to=reply_ref, embed=embed_r, facets=facets_r)
+                        else:
+                            rresp = self._client.send_post(text=safe, reply_to=reply_ref, embed=embed_r)
+                    else:
+                        if facets_r:
+                            rresp = self._client.send_post(text=safe, reply_to=reply_ref, facets=facets_r)
+                        else:
+                            rresp = self._client.send_post(text=safe, reply_to=reply_ref)
+                    # Update parent to this reply for the next segment
+                    try:
+                        pu = getattr(rresp, "uri", None) if rresp is not None else None
+                        pc = getattr(rresp, "cid", None) if rresp is not None else None
+                        if pu is None and isinstance(rresp, dict):
+                            pu = rresp.get("uri")
+                            pc = rresp.get("cid")
+                        if pu and pc:
+                            parent_uri, parent_cid = pu, pc
+                    except Exception:
+                        pass
+                    logger.info("Bsky: posted thread reply {}/{} ({} chars)", idx - 1, len(posts) - 1, len(safe))
+                except Exception as exc:
+                    logger.warning("Bsky: failed to post thread reply {}/{}: {}", idx - 1, len(posts) - 1, exc)
+            return True
+        except Exception as exc:
+            logger.error("Bsky: failed to post thread: {}", exc)
             return False
 
     # Read timeline and prepare a reply target
@@ -747,10 +920,13 @@ class BskyBot:
                     already_replied_this = bool(uri and uri in self._replied_uris)
                     if not uri or not cid:
                         continue
-                    # Skip sports-related posts
-                    if self._is_sports_text(text):
-                        logger.info("Bsky: skipping sports post uri={}", uri)
-                        continue
+                    # Skip sports-related posts (LLM-driven)
+                    try:
+                        if self._llm.is_sports_text(text):
+                            logger.info("Bsky: skipping sports post uri={}", uri)
+                            continue
+                    except Exception:
+                        pass
                     # Skip recently replied-to authors (cooldown)
                     recent_author = bool(author and author in self._recent_authors)
                     # If this is a reply, try to find the root and skip if we've replied to that root recently
@@ -793,20 +969,31 @@ class BskyBot:
                             ctx["quoted_post"] = quoted
                     except Exception:
                         pass
-                    # Try to pull an external link if present in embed
+                    # Extract external link and require useful URL context to consider replying
+                    external_url = None
                     try:
                         external_url = self._extract_external_url_from_post_view(post)
+                        if not external_url:
+                            # Try to detect from text
+                            for tok in text.split():
+                                if tok.startswith("http://") or tok.startswith("https://"):
+                                    external_url = tok
+                                    break
                         if external_url:
-                            ctx["urls"] = [external_url]
-                            ctx["original_has_url"] = True
-                        else:
-                            # Also mark if text itself has a URL-like substring
-                            if "http://" in text or "https://" in text:
-                                ctx["original_has_url"] = True
+                            # Fetch metadata quickly and ask LLM if it's useful context
+                            title, art_text, _ = self._fetch_url_metadata(external_url) or (None, None, None)
+                            if art_text:
+                                try:
+                                    if self._llm.is_url_context_useful(text, title or "", art_text or ""):
+                                        ctx["urls"] = [external_url]
+                                        ctx["original_has_url"] = True
+                                    else:
+                                        # Not useful: treat as no-url for reply selection
+                                        external_url = None
+                                except Exception:
+                                    pass
                     except Exception:
-                        # Basic heuristic from text
-                        if "http://" in text or "https://" in text:
-                            ctx["original_has_url"] = True
+                        external_url = None
                     # Include thread, quoted, and external link context if present
                     if thread_ctx and thread_ctx.get("root_post"):
                         ctx.update({
@@ -822,15 +1009,27 @@ class BskyBot:
                         pass
                     try:
                         external_url = self._extract_external_url_from_post_view(post)
+                        # If no embed, try to parse from text
+                        if not external_url:
+                            for tok in (text or "").split():
+                                if tok.startswith("http://") or tok.startswith("https://"):
+                                    external_url = tok
+                                    break
                         if external_url:
-                            ctx["urls"] = [external_url]
-                            ctx["original_has_url"] = True
-                        else:
-                            if "http://" in text or "https://" in text:
-                                ctx["original_has_url"] = True
+                            # Ask LLM if this URL is actually useful for grounding
+                            try:
+                                title, art_text, _ = self._fetch_url_metadata(external_url) or (None, None, None)
+                            except Exception:
+                                title, art_text = None, None
+                            if art_text:
+                                try:
+                                    if self._llm.is_url_context_useful(text, title or "", art_text or ""):
+                                        ctx["urls"] = [external_url]
+                                        ctx["original_has_url"] = True
+                                except Exception:
+                                    pass
                     except Exception:
-                        if "http://" in text or "https://" in text:
-                            ctx["original_has_url"] = True
+                        pass
                     item_obj = {
                         "uri": uri,
                         "cid": cid,
@@ -841,11 +1040,13 @@ class BskyBot:
                         "created_ts": created_ts,
                         "is_following": is_following,
                     }
-                    # Strict pool: only if not recently replied and not root duplicate
-                    if not recent_author and not root_already_replied and not already_replied_this:
+                    # Strict pool: only if not recently replied and not root duplicate and has useful URL context
+                    has_useful_url = bool(ctx.get("urls"))
+                    if not recent_author and not root_already_replied and not already_replied_this and has_useful_url:
                         candidates.append(item_obj)
                     # Relaxed pool: allow recent/root duplicates to avoid empty selections
-                    relaxed_candidates.append(item_obj)
+                    if has_useful_url:
+                        relaxed_candidates.append(item_obj)
             if not candidates:
                 logger.warning("Bsky: no suitable post found in timeline; trying relaxed selection")
                 if not relaxed_candidates:
@@ -1539,6 +1740,16 @@ class BskyBot:
             logger.warning("Bsky: send_prepared_reply called without target")
             return False
         try:
+            # Sanitize reply text to avoid weird symbols and hard trim
+            try:
+                max_len = min(300, max(1, int(getattr(self._config, "bsky_reply_max_chars", 300))))
+            except Exception:
+                max_len = 300
+            try:
+                text = self._llm.sanitize_for_bsky(text, max_len)
+            except Exception:
+                if len(text) > max_len:
+                    text = text[: max_len - 3] + "..."
             reply_ref = self._reply_target.get("reply_ref")
             if not reply_ref:
                 uri = self._reply_target.get("uri")
